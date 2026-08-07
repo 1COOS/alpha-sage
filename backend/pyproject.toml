@@ -1,0 +1,55 @@
+[project]
+name = "alpha-sage-backend"
+version = "0.1.0"
+description = "Local cognition-first self-evolving paper investment agent"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "alembic>=1.16.0,<2",
+  "apscheduler>=3.11.0,<4",
+  "baostock>=0.8.9,<1",
+  "beautifulsoup4>=4.13.0,<5",
+  "duckdb>=1.3.0,<2",
+  "fastapi>=0.116.0,<1",
+  "httpx>=0.28.0,<1",
+  "keyring>=25.6.0,<26",
+  "numpy>=2.2.0,<3",
+  "openai>=1.99.0,<2",
+  "pandas>=2.3.0,<3",
+  "pyarrow>=21.0.0,<22",
+  "pydantic-settings>=2.10.0,<3",
+  "python-dateutil>=2.9.0.post0,<3",
+  "sqlalchemy>=2.0.40,<3",
+  "typer>=0.16.0,<1",
+  "uvicorn[standard]>=0.35.0,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.4.0,<9",
+  "pytest-asyncio>=1.1.0,<2",
+  "pytest-cov>=6.2.0,<7",
+  "respx>=0.22.0,<1",
+  "ruff>=0.12.0,<1",
+]
+
+[project.scripts]
+alpha-sage = "app.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
