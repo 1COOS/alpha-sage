@@ -26,6 +26,52 @@ export type SystemStatus = {
   blockers: string[];
 };
 
+export type AgentRun = {
+  id: string;
+  kind: string;
+  status: "PENDING" | "RUNNING" | "COMPLETED" | "BLOCKED" | "FAILED" | "SKIPPED";
+  trigger_source: string;
+  parameters: Record<string, unknown>;
+  trade_date?: string | null;
+  stage?: string | null;
+  progress_current?: number | null;
+  progress_total?: number | null;
+  progress_message?: string | null;
+  blocker?: string | null;
+  result: Record<string, unknown>;
+  started_at: string;
+  updated_at?: string | null;
+  finished_at?: string | null;
+};
+
+export type RunAccepted = {
+  run_id: string;
+  kind: string;
+  status: AgentRun["status"];
+  stage?: string | null;
+  message?: string | null;
+};
+
+export type LocalActionFeedback = {
+  id: string;
+  label: string;
+  status: "RUNNING" | "COMPLETED" | "FAILED";
+  message: string;
+  detail?: string;
+  started_at: string;
+  finished_at?: string;
+};
+
+export type ActionFeedbackSummary = {
+  id: string;
+  label: string;
+  status: AgentRun["status"] | LocalActionFeedback["status"];
+  message: string;
+  stage?: string | null;
+};
+
+export type ActionFeedbackMap = ReadonlyMap<string, ActionFeedbackSummary>;
+
 export type Research = {
   id: string;
   instrument_id: string;
@@ -154,3 +200,5 @@ export type ActionRunner = (
   label: string,
   operation: () => Promise<unknown>,
 ) => Promise<void>;
+
+export type BusyActions = ReadonlySet<string>;

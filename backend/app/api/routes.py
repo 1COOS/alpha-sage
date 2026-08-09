@@ -5,13 +5,14 @@ import json
 from datetime import date
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from app.db import SessionLocal, get_session
+from app.db import get_session
+from app.domain.enums import RunKind
 from app.domain.schemas import (
     ChallengerApproval,
     ChatInput,
@@ -40,17 +41,39 @@ from app.models import (
 )
 from app.services.agent import SYSTEM_PROMPT, CognitiveAgent
 from app.services.audit import append_audit
-from app.services.data_sync import HistorySyncService
+from app.services.data_sync import HistorySyncProgress, HistorySyncService
 from app.services.evidence import TrustedEvidenceService
 from app.services.evolution import EvolutionService, ExperienceService
 from app.services.intraday import IntradayService
-from app.services.model import OpenAICompatibleModel
+from app.services.model import OpenAICompatibleModel, resolve_model_settings
+from app.services.model_test import run_model_connection_test
 from app.services.portfolio import PortfolioService
 from app.services.preflight import PreflightService
+from app.services.run_queue import RUN_QUEUE, ActiveRunConflict, RunProgressReporter
 from app.services.secrets import SecretStore
 
 router = APIRouter(prefix="/api/v1")
 DbSession = Annotated[Session, Depends(get_session)]
+
+
+def _accepted(run: AgentRun) -> dict:
+    return {
+        "run_id": run.id,
+        "kind": run.kind,
+        "status": run.status,
+        "stage": run.stage,
+        "message": run.progress_message,
+    }
+
+
+def _submit_or_conflict(**kwargs) -> AgentRun:
+    try:
+        return RUN_QUEUE.submit(**kwargs)
+    except ActiveRunConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": str(exc), "run_id": exc.run.id, "kind": exc.run.kind, "status": exc.run.status},
+        ) from exc
 
 
 @router.get("/health")
@@ -109,19 +132,29 @@ def pause_account(session: DbSession, reason: str = "用户手动暂停") -> dic
     return {"enabled": False, "reason": reason}
 
 
-def _sync_history_task(years: int, limit: int | None) -> None:
-    with SessionLocal() as session:
-        asyncio.run(HistorySyncService(session).sync(years=years, limit=limit))
-
-
 @router.post("/data/sync-history", status_code=202)
 def sync_history(
-    background: BackgroundTasks,
     years: int = Query(default=5, ge=1, le=10),
     limit: int | None = Query(default=None, ge=1),
 ) -> dict:
-    background.add_task(_sync_history_task, years, limit)
-    return {"accepted": True, "years": years, "limit": limit}
+    def job(session: Session, run: AgentRun, reporter: RunProgressReporter) -> AgentRun:
+        def progress(item: HistorySyncProgress) -> None:
+            reporter.update(
+                item.phase.upper(),
+                item.detail,
+                current=item.current,
+                total=item.total,
+            )
+
+        return asyncio.run(HistorySyncService(session, progress=progress).sync(years=years, limit=limit, run=run))
+
+    run = _submit_or_conflict(
+        kind=RunKind.DATA_SYNC,
+        trigger_source="MANUAL",
+        parameters={"years": years, "limit": limit},
+        job=job,
+    )
+    return _accepted(run)
 
 
 @router.get("/data/sources")
@@ -150,26 +183,84 @@ def add_evidence(payload: EvidenceInput, session: DbSession, instrument_id: str 
     return jsonable_encoder(TrustedEvidenceService(session).add_structured(payload, instrument))
 
 
-@router.post("/agent/eod")
-def run_eod(session: DbSession, trade_date: date | None = None) -> dict:
-    return jsonable_encoder(CognitiveAgent(session).run_eod(trade_date or date.today()))
+@router.post("/agent/eod", status_code=202)
+def run_eod(trade_date: date | None = None) -> dict:
+    resolved = trade_date or date.today()
+
+    def job(session: Session, run: AgentRun, reporter: RunProgressReporter) -> AgentRun:
+        return CognitiveAgent(session).run_eod(resolved, run=run, reporter=reporter)
+
+    run = _submit_or_conflict(
+        kind=RunKind.EOD,
+        trigger_source="MANUAL",
+        parameters={"trade_date": resolved.isoformat()},
+        trade_date=resolved,
+        job=job,
+    )
+    return _accepted(run)
 
 
-@router.post("/agent/intraday")
-async def run_intraday(session: DbSession, trade_date: date | None = None) -> dict:
-    return jsonable_encoder(await IntradayService(session).run(trade_date))
+@router.post("/agent/intraday", status_code=202)
+def run_intraday(trade_date: date | None = None) -> dict:
+    resolved = trade_date or date.today()
+
+    def job(session: Session, run: AgentRun, reporter: RunProgressReporter) -> AgentRun:
+        return asyncio.run(IntradayService(session).run(resolved, run=run, reporter=reporter))
+
+    run = _submit_or_conflict(
+        kind=RunKind.INTRADAY,
+        trigger_source="MANUAL",
+        parameters={"trade_date": resolved.isoformat()},
+        trade_date=resolved,
+        job=job,
+    )
+    return _accepted(run)
 
 
-@router.post("/agent/attribute")
-def attribute(session: DbSession, as_of: date | None = None) -> dict:
-    rows = ExperienceService(session).attribute_due(as_of)
-    return {"created": len(rows), "ids": [row.id for row in rows]}
+@router.post("/agent/attribute", status_code=202)
+def attribute(as_of: date | None = None) -> dict:
+    resolved = as_of or date.today()
+
+    def job(session: Session, run: AgentRun, reporter: RunProgressReporter) -> AgentRun:
+        reporter.update("ATTRIBUTING", "计算到期决策的真实结果与归因")
+        rows = ExperienceService(session).attribute_due(resolved)
+        return reporter.complete(
+            {"created": len(rows), "ids": [row.id for row in rows]},
+            f"归因完成，新增 {len(rows)} 条经验",
+        )
+
+    run = _submit_or_conflict(
+        kind=RunKind.ATTRIBUTION,
+        trigger_source="MANUAL",
+        parameters={"as_of": resolved.isoformat()},
+        trade_date=resolved,
+        job=job,
+    )
+    return _accepted(run)
 
 
 @router.get("/agent/runs")
-def runs(session: DbSession, limit: int = Query(default=50, ge=1, le=200)) -> list[dict]:
-    rows = session.scalars(select(AgentRun).order_by(AgentRun.started_at.desc()).limit(limit))
+def runs(
+    session: DbSession,
+    limit: int = Query(default=50, ge=1, le=200),
+    status: str | None = None,
+    kind: str | None = None,
+) -> list[dict]:
+    query = select(AgentRun)
+    if status:
+        query = query.where(AgentRun.status == status)
+    if kind:
+        query = query.where(AgentRun.kind == kind)
+    rows = session.scalars(query.order_by(AgentRun.started_at.desc()).limit(limit))
     return [jsonable_encoder(row) for row in rows]
+
+
+@router.get("/agent/runs/{run_id}")
+def run_detail(run_id: str, session: DbSession) -> dict:
+    run = session.get(AgentRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return jsonable_encoder(run)
 
 
 @router.get("/research")
@@ -349,14 +440,38 @@ def feedback_rows(session: DbSession, limit: int = Query(default=100, ge=1, le=5
     ]
 
 
-@router.post("/evolution/weekly")
-def weekly(session: DbSession) -> dict:
-    return jsonable_encoder(EvolutionService(session).generate_weekly_lessons())
+@router.post("/evolution/weekly", status_code=202)
+def weekly() -> dict:
+    resolved = date.today()
+
+    def job(session: Session, run: AgentRun, reporter: RunProgressReporter) -> AgentRun:
+        return EvolutionService(session).generate_weekly_lessons(resolved, run=run, reporter=reporter)
+
+    run = _submit_or_conflict(
+        kind=RunKind.WEEKLY,
+        trigger_source="MANUAL",
+        parameters={"week_ending": resolved.isoformat()},
+        trade_date=resolved,
+        job=job,
+    )
+    return _accepted(run)
 
 
-@router.post("/evolution/monthly")
-def monthly(session: DbSession) -> dict:
-    return jsonable_encoder(EvolutionService(session).generate_monthly_challenger())
+@router.post("/evolution/monthly", status_code=202)
+def monthly() -> dict:
+    resolved = date.today()
+
+    def job(session: Session, run: AgentRun, reporter: RunProgressReporter) -> AgentRun:
+        return EvolutionService(session).generate_monthly_challenger(resolved, run=run, reporter=reporter)
+
+    run = _submit_or_conflict(
+        kind=RunKind.MONTHLY,
+        trigger_source="MANUAL",
+        parameters={"as_of": resolved.isoformat()},
+        trade_date=resolved,
+        job=job,
+    )
+    return _accepted(run)
 
 
 @router.get("/evolution/challengers")
@@ -403,8 +518,7 @@ def rollback(session: DbSession, reason: str) -> dict:
 
 @router.get("/settings/model")
 def get_model_settings(session: DbSession) -> dict:
-    row = session.get(SystemSetting, "model_settings")
-    return (row.value if row else {}) | {"api_key_configured": SecretStore.is_configured()}
+    return resolve_model_settings(session, require_api_key=False).public_dict()
 
 
 @router.put("/settings/model")
@@ -420,7 +534,30 @@ def set_model_settings(payload: ModelSettingsInput, session: DbSession) -> dict:
         row.value = value
         row.updated_at = utc_now()
     session.commit()
-    return value | {"api_key_configured": SecretStore.is_configured()}
+    return resolve_model_settings(session, require_api_key=False).public_dict()
+
+
+@router.post("/settings/model/test", status_code=202)
+def test_model_settings(payload: ModelSettingsInput) -> dict:
+    candidate = payload.model_dump(exclude={"api_key"})
+    transient_key = payload.api_key.strip() if payload.api_key else None
+
+    def job(session: Session, run: AgentRun, reporter: RunProgressReporter) -> AgentRun:
+        return run_model_connection_test(
+            session,
+            run,
+            reporter,
+            candidate=candidate,
+            api_key_override=transient_key,
+        )
+
+    run = _submit_or_conflict(
+        kind=RunKind.MODEL_TEST,
+        trigger_source="MANUAL",
+        parameters=candidate | {"api_key_supplied": bool(transient_key)},
+        job=job,
+    )
+    return _accepted(run)
 
 
 @router.post("/chat")

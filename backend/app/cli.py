@@ -11,12 +11,22 @@ from app.config import BACKEND_ROOT
 from app.db import SessionLocal
 from app.services.agent import CognitiveAgent
 from app.services.bootstrap import bootstrap_system
-from app.services.data_sync import HistorySyncService
+from app.services.data_sync import HistorySyncProgress, HistorySyncService
 from app.services.evolution import EvolutionService, ExperienceService
 from app.services.intraday import IntradayService
 from app.services.preflight import PreflightService
 
 app = typer.Typer(no_args_is_help=True)
+
+
+def _show_history_sync_progress(progress: HistorySyncProgress) -> None:
+    if progress.phase == "instrument":
+        typer.echo(
+            f"[历史同步] {progress.current}/{progress.total} | {progress.symbol} | {progress.detail} | "
+            f"确认 {progress.confirmed} | 精选 {progress.accepted} | 阻断 {progress.blocked}"
+        )
+        return
+    typer.echo(f"[历史同步] {progress.detail}")
 
 
 @app.command("migrate")
@@ -44,7 +54,9 @@ def preflight() -> None:
 @app.command("sync-history")
 def sync_history(years: int = 5, limit: int | None = None) -> None:
     with SessionLocal() as session:
-        run = asyncio.run(HistorySyncService(session).sync(years=years, limit=limit))
+        run = asyncio.run(
+            HistorySyncService(session, progress=_show_history_sync_progress).sync(years=years, limit=limit)
+        )
         typer.echo(f"{run.status}: {run.result or run.blocker}")
         raise typer.Exit(0 if run.status == "COMPLETED" else 2)
 

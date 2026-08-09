@@ -2,11 +2,27 @@ import httpx
 from fastapi import FastAPI
 from sqlalchemy import text
 
+from app.api import routes
 from app.api.routes import router
 from app.db import get_session
+from app.domain.enums import RunStatus
+from app.models import AgentRun
 
 
-async def test_status_and_paused_agent_routes_do_not_require_model_key(session):
+async def test_status_and_agent_submission_do_not_require_model_key(session, monkeypatch):
+    class FakeQueue:
+        def submit(self, **kwargs):
+            return AgentRun(
+                id="run_test",
+                kind=kwargs["kind"],
+                status=RunStatus.PENDING,
+                trigger_source=kwargs["trigger_source"],
+                parameters=kwargs["parameters"],
+                stage="QUEUED",
+                progress_message="等待前序任务完成",
+            )
+
+    monkeypatch.setattr(routes, "RUN_QUEUE", FakeQueue())
     test_app = FastAPI()
     test_app.include_router(router)
 
@@ -21,9 +37,9 @@ async def test_status_and_paused_agent_routes_do_not_require_model_key(session):
         assert status.json()["account_enabled"] is False
 
         eod = await client.post("/api/v1/agent/eod")
-        assert eod.status_code == 200
-        assert eod.json()["status"] == "BLOCKED"
-        assert "尚未人工启用" in eod.json()["blocker"]
+        assert eod.status_code == 202
+        assert eod.json()["status"] == "PENDING"
+        assert eod.json()["kind"] == "EOD"
 
         enable = await client.post(
             "/api/v1/system/enable",
@@ -75,3 +91,42 @@ async def test_experience_search_uses_fts5_index(session):
 
     assert response.status_code == 200
     assert response.json()[0]["id"] == "exp_fts"
+
+
+async def test_model_connection_test_queues_current_form_without_persisting_key(monkeypatch):
+    captured = {}
+
+    class FakeQueue:
+        def submit(self, **kwargs):
+            captured.update(kwargs)
+            return AgentRun(
+                id="run_model_test",
+                kind=kwargs["kind"],
+                status=RunStatus.PENDING,
+                trigger_source=kwargs["trigger_source"],
+                parameters=kwargs["parameters"],
+                stage="QUEUED",
+            )
+
+    monkeypatch.setattr(routes, "RUN_QUEUE", FakeQueue())
+    test_app = FastAPI()
+    test_app.include_router(router)
+    transport = httpx.ASGITransport(app=test_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/settings/model/test",
+            json={
+                "base_url": "https://provider.example/v1",
+                "api_mode": "responses",
+                "reasoning_model": "reasoning-current-form",
+                "fast_model": "fast-current-form",
+                "daily_request_budget": 100,
+                "api_key": "temporary-key",
+            },
+        )
+
+    assert response.status_code == 202
+    assert response.json()["run_id"] == "run_model_test"
+    assert captured["parameters"]["reasoning_model"] == "reasoning-current-form"
+    assert captured["parameters"]["api_key_supplied"] is True
+    assert "api_key" not in captured["parameters"]

@@ -4,6 +4,8 @@ import os
 
 import keyring
 
+from app.config import get_settings
+
 SERVICE_NAME = "alpha-sage"
 
 
@@ -11,7 +13,9 @@ class SecretStore:
     @staticmethod
     def get_api_key() -> str | None:
         if value := os.getenv("OPENAI_API_KEY"):
-            return value
+            return value.strip()
+        if value := get_settings().openai_api_key:
+            return value.strip()
         try:
             return keyring.get_password(SERVICE_NAME, "openai-api-key")
         except keyring.errors.KeyringError:

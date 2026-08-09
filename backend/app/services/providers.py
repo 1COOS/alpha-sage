@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import threading
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from typing import Protocol
+from typing import ClassVar, Protocol, TypeVar
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -14,6 +16,7 @@ import httpx
 from app.config import get_settings
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -219,18 +222,70 @@ class EastmoneyProvider:
 
 class BaoStockProvider:
     provider_id = "baostock"
+    # BaoStock keeps login state at process level. Serialize all calls and
+    # reference-count explicit task sessions so a full history sync can reuse
+    # one login without making isolated provider calls leak a session.
+    _session_lock: ClassVar[threading.RLock] = threading.RLock()
+    _session_users: ClassVar[int] = 0
+
+    def __init__(self) -> None:
+        self._session_depth = 0
+
+    async def open(self) -> None:
+        await asyncio.to_thread(self._open_sync)
+
+    def _open_sync(self) -> None:
+        import baostock as bs
+
+        cls = type(self)
+        with cls._session_lock:
+            if cls._session_users == 0:
+                self._login_locked(bs)
+            cls._session_users += 1
+            self._session_depth += 1
+
+    async def close(self) -> None:
+        await asyncio.to_thread(self._close_sync)
+
+    def _close_sync(self) -> None:
+        import baostock as bs
+
+        cls = type(self)
+        with cls._session_lock:
+            if self._session_depth == 0:
+                return
+            self._session_depth -= 1
+            cls._session_users -= 1
+            if cls._session_users == 0:
+                bs.logout()
+
+    @staticmethod
+    def _login_locked(bs: object) -> None:
+        login = bs.login()
+        if login.error_code != "0":
+            raise RuntimeError(f"baostock login failed: {login.error_msg}")
+
+    def _run_query(self, operation: Callable[[], T]) -> T:
+        import baostock as bs
+
+        cls = type(self)
+        with cls._session_lock:
+            temporary_session = cls._session_users == 0
+            if temporary_session:
+                self._login_locked(bs)
+            try:
+                return operation()
+            finally:
+                if temporary_session:
+                    bs.logout()
 
     async def fetch_universe(self) -> list[InstrumentSeed]:
         return await asyncio.to_thread(self._fetch_universe_sync)
 
-    @staticmethod
-    def _fetch_universe_sync() -> list[InstrumentSeed]:
+    def _fetch_universe_sync(self) -> list[InstrumentSeed]:
         import baostock as bs
 
-        login = bs.login()
-        if login.error_code != "0":
-            raise RuntimeError(f"baostock login failed: {login.error_msg}")
-        try:
+        def query_universe() -> list[InstrumentSeed]:
             query = bs.query_stock_basic()
             if query.error_code != "0":
                 raise RuntimeError(f"baostock universe failed: {query.error_msg}")
@@ -256,8 +311,8 @@ class BaoStockProvider:
                     )
                 )
             return rows
-        finally:
-            bs.logout()
+
+        return self._run_query(query_universe)
 
     async def fetch_daily_bars(self, seed: InstrumentSeed, start: date, end: date) -> list[Bar]:
         return await asyncio.to_thread(self._fetch_daily_sync, seed, start, end)
@@ -265,10 +320,7 @@ class BaoStockProvider:
     def _fetch_daily_sync(self, seed: InstrumentSeed, start: date, end: date) -> list[Bar]:
         import baostock as bs
 
-        login = bs.login()
-        if login.error_code != "0":
-            raise RuntimeError(f"baostock login failed: {login.error_msg}")
-        try:
+        def query_daily_bars() -> list[Bar]:
             prefix = "sh" if seed.exchange == "SSE" else "sz"
             query = bs.query_history_k_data_plus(
                 f"{prefix}.{seed.symbol}",
@@ -305,20 +357,16 @@ class BaoStockProvider:
                     )
                 )
             return result
-        finally:
-            bs.logout()
+
+        return self._run_query(query_daily_bars)
 
     async def fetch_calendar(self, start: date, end: date) -> list[tuple[date, bool]]:
         return await asyncio.to_thread(self._fetch_calendar_sync, start, end)
 
-    @staticmethod
-    def _fetch_calendar_sync(start: date, end: date) -> list[tuple[date, bool]]:
+    def _fetch_calendar_sync(self, start: date, end: date) -> list[tuple[date, bool]]:
         import baostock as bs
 
-        login = bs.login()
-        if login.error_code != "0":
-            raise RuntimeError(f"baostock login failed: {login.error_msg}")
-        try:
+        def query_calendar() -> list[tuple[date, bool]]:
             query = bs.query_trade_dates(start_date=start.isoformat(), end_date=end.isoformat())
             if query.error_code != "0":
                 raise RuntimeError(f"baostock calendar failed: {query.error_msg}")
@@ -327,8 +375,8 @@ class BaoStockProvider:
                 raw_date, is_trading = query.get_row_data()
                 rows.append((date.fromisoformat(raw_date), is_trading == "1"))
             return rows
-        finally:
-            bs.logout()
+
+        return self._run_query(query_calendar)
 
 
 class TencentQuoteProvider:

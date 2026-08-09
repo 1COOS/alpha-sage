@@ -7,11 +7,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router
 from app.config import get_settings
+from app.services.run_queue import RUN_QUEUE
 from app.services.scheduler import create_scheduler
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    RUN_QUEUE.recover_stale_runs()
     scheduler = create_scheduler()
     if scheduler:
         scheduler.start()
@@ -20,6 +22,7 @@ async def lifespan(_app: FastAPI):
     finally:
         if scheduler:
             scheduler.shutdown(wait=False)
+        RUN_QUEUE.shutdown()
 
 
 settings = get_settings()

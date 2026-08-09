@@ -139,14 +139,24 @@ class DataArtifact(Base):
 
 class AgentRun(Base):
     __tablename__ = "agent_runs"
-    __table_args__ = (Index("ix_agent_runs_kind_started", "kind", "started_at"),)
+    __table_args__ = (
+        Index("ix_agent_runs_kind_started", "kind", "started_at"),
+        Index("ix_agent_runs_status_started", "status", "started_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: new_id("run"))
     kind: Mapped[str] = mapped_column(String(32))
     status: Mapped[str] = mapped_column(String(32))
+    trigger_source: Mapped[str] = mapped_column(String(32), default="SYSTEM")
+    parameters: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     trade_date: Mapped[date | None] = mapped_column(Date)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    stage: Mapped[str | None] = mapped_column(String(80))
+    progress_current: Mapped[int | None] = mapped_column(Integer)
+    progress_total: Mapped[int | None] = mapped_column(Integer)
+    progress_message: Mapped[str | None] = mapped_column(Text)
     blocker: Mapped[str | None] = mapped_column(Text)
     input_versions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
@@ -411,6 +421,11 @@ class ModelInvocation(Base):
     response_hash: Mapped[str] = mapped_column(String(64))
     request_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     response_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(20), default="COMPLETED")
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    http_status: Mapped[int | None] = mapped_column(Integer)
+    error_type: Mapped[str | None] = mapped_column(String(80))
+    error_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 

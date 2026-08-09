@@ -26,7 +26,9 @@ from app.services.agent import CognitiveAgent
 from app.services.artifacts import ArtifactStore
 from app.services.broker import FillBlocked, PaperBroker
 from app.services.market_adapter import CNMarketAdapter
+from app.services.model import format_run_failure, has_model_failure
 from app.services.providers import EastmoneyProvider, InstrumentSeed, TencentQuoteProvider
+from app.services.run_queue import RunProgressReporter
 
 
 class IntradayService:
@@ -52,11 +54,21 @@ class IntradayService:
             self._agent = CognitiveAgent(self.session)
         return self._agent
 
-    async def run(self, trade_date: date | None = None) -> AgentRun:
+    async def run(
+        self,
+        trade_date: date | None = None,
+        *,
+        run: AgentRun | None = None,
+        reporter: RunProgressReporter | None = None,
+    ) -> AgentRun:
         trade_date = trade_date or datetime.now().astimezone().date()
-        run = AgentRun(kind=RunKind.INTRADAY, status=RunStatus.RUNNING, trade_date=trade_date)
-        self.session.add(run)
-        self.session.commit()
+        if run is None:
+            run = AgentRun(kind=RunKind.INTRADAY, status=RunStatus.RUNNING, trade_date=trade_date)
+            self.session.add(run)
+            self.session.commit()
+        run.trade_date = trade_date
+        if reporter:
+            reporter.update("PREFLIGHT", "检查账户状态与待复核标的")
         account = self.session.scalar(select(Account).where(Account.name == "paper-main"))
         risk_liquidation_only = bool(
             account
@@ -72,6 +84,9 @@ class IntradayService:
                 run.status = RunStatus.COMPLETED
                 run.result = {"watched": 0, "revisions": 0, "fills": 0}
                 run.finished_at = utc_now()
+                run.updated_at = run.finished_at
+                run.stage = "COMPLETED"
+                run.progress_message = "没有需要复核的持仓或待成交订单"
                 self.session.commit()
                 return run
             total_calls = (
@@ -85,7 +100,14 @@ class IntradayService:
             revisions = 0
             fills = 0
             blocked: list[dict[str, str]] = []
-            for instrument in instruments:
+            for index, instrument in enumerate(instruments, start=1):
+                if reporter:
+                    reporter.update(
+                        "INTRADAY_REVIEW",
+                        f"复核 {instrument.symbol} {instrument.name}",
+                        current=index - 1,
+                        total=len(instruments),
+                    )
                 seed = InstrumentSeed(
                     exchange=instrument.exchange,
                     symbol=instrument.symbol,
@@ -161,9 +183,16 @@ class IntradayService:
                     total_calls += 1
                     self.session.commit()
                 except Exception as exc:  # noqa: BLE001 - source failures are isolated by symbol
+                    if has_model_failure(exc):
+                        raise
                     blocked.append({"symbol": instrument.symbol, "reason": str(exc)})
             run.status = RunStatus.COMPLETED
             run.finished_at = utc_now()
+            run.updated_at = run.finished_at
+            run.stage = "COMPLETED"
+            run.progress_current = len(instruments)
+            run.progress_total = len(instruments)
+            run.progress_message = "盘中复核完成"
             run.result = {
                 "watched": len(instruments),
                 "revisions": revisions,
@@ -176,9 +205,20 @@ class IntradayService:
             self.session.commit()
             return run
         except Exception as exc:
+            failed_stage = run.stage
+            message, result = format_run_failure(
+                self.session,
+                run_id=run.id,
+                stage=failed_stage,
+                exc=exc,
+            )
             run.status = RunStatus.FAILED
-            run.blocker = str(exc)
+            run.blocker = message
             run.finished_at = utc_now()
+            run.updated_at = run.finished_at
+            run.stage = failed_stage or "FAILED"
+            run.progress_message = message
+            run.result = result
             self.session.commit()
             return run
         finally:
@@ -341,5 +381,8 @@ class IntradayService:
         run.status = RunStatus.BLOCKED
         run.blocker = reason
         run.finished_at = utc_now()
+        run.updated_at = run.finished_at
+        run.stage = "BLOCKED"
+        run.progress_message = reason
         self.session.commit()
         return run

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import statistics
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
@@ -32,6 +33,18 @@ class DataQualityBlocked(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class HistorySyncProgress:
+    phase: str
+    detail: str
+    current: int | None = None
+    total: int | None = None
+    symbol: str | None = None
+    confirmed: int = 0
+    accepted: int = 0
+    blocked: int = 0
+
+
 class HistorySyncService:
     def __init__(
         self,
@@ -41,6 +54,8 @@ class HistorySyncService:
         baostock: BaoStockProvider | None = None,
         tencent_history: TencentHistoryProvider | None = None,
         market: MarketAdapter | None = None,
+        progress: Callable[[HistorySyncProgress], None] | None = None,
+        progress_every: int = 25,
     ):
         self.session = session
         self.eastmoney = eastmoney or EastmoneyProvider()
@@ -49,15 +64,33 @@ class HistorySyncService:
         self.market = market or CNMarketAdapter(session)
         self.artifacts = ArtifactStore(session)
         self.primary_history_fallbacks: list[dict[str, str]] = []
+        self.progress = progress
+        self.progress_every = max(1, progress_every)
 
-    async def sync(self, *, years: int = 5, limit: int | None = None) -> AgentRun:
-        run = AgentRun(kind=RunKind.DATA_SYNC, status=RunStatus.RUNNING)
-        self.session.add(run)
-        self.session.commit()
+    async def sync(
+        self,
+        *,
+        years: int = 5,
+        limit: int | None = None,
+        run: AgentRun | None = None,
+    ) -> AgentRun:
+        self.primary_history_fallbacks.clear()
+        if run is None:
+            run = AgentRun(kind=RunKind.DATA_SYNC, status=RunStatus.RUNNING)
+            self.session.add(run)
+            self.session.commit()
         try:
+            await self.baostock.open()
             end = datetime.now().astimezone().date()
             start = end - timedelta(days=years * 366)
+            self._emit_progress(
+                HistorySyncProgress(
+                    phase="calendar",
+                    detail=f"同步交易日历 {start.isoformat()} 至 {(end + timedelta(days=366)).isoformat()}",
+                )
+            )
             await self._sync_calendar(start, end + timedelta(days=366))
+            self._emit_progress(HistorySyncProgress(phase="universe", detail="获取沪深股票与 ETF 证券池"))
             universe_provider = "eastmoney"
             universe_fallback_reason = None
             try:
@@ -76,20 +109,47 @@ class HistorySyncService:
             )
             if limit:
                 universe = universe[:limit]
+            total = len(universe)
             confirmed = 0
             accepted = 0
             blocked: list[dict[str, str]] = []
+            self._emit_progress(
+                HistorySyncProgress(
+                    phase="history",
+                    detail=f"开始串行同步 {total} 个标的的五年历史并执行双源校验",
+                    current=0,
+                    total=total,
+                )
+            )
             # SQLAlchemy Session and BaoStock's process-wide login state are not
             # concurrency-safe. Process instruments serially so every artifact,
             # universe update and source call belongs to one deterministic unit.
-            for seed in universe:
+            for index, seed in enumerate(universe, start=1):
+                outcome = "已确认"
                 try:
                     investable = await self._sync_instrument(seed, start, end)
                     confirmed += 1
                     if investable:
                         accepted += 1
+                        outcome = "已进入精选池"
+                    else:
+                        outcome = "已确认，未达到精选池门槛"
                 except Exception as exc:  # noqa: BLE001 - source failures are persisted
                     blocked.append({"symbol": seed.symbol, "reason": str(exc)})
+                    outcome = "已阻断"
+                if index == 1 or index % self.progress_every == 0 or index == total:
+                    self._emit_progress(
+                        HistorySyncProgress(
+                            phase="instrument",
+                            detail=outcome,
+                            current=index,
+                            total=total,
+                            symbol=seed.symbol,
+                            confirmed=confirmed,
+                            accepted=accepted,
+                            blocked=len(blocked),
+                        )
+                    )
             run.result = {
                 "requested": len(universe),
                 "confirmed": confirmed,
@@ -105,6 +165,11 @@ class HistorySyncService:
                 raise DataQualityBlocked("没有任何标的通过双源历史数据校验")
             run.status = RunStatus.COMPLETED
             run.finished_at = utc_now()
+            run.updated_at = run.finished_at
+            run.stage = "COMPLETED"
+            run.progress_current = total
+            run.progress_total = total
+            run.progress_message = f"同步完成：确认 {confirmed}，精选 {accepted}，阻断 {len(blocked)}"
             eastmoney_status = (
                 SourceHealthStatus.DEGRADED if self.primary_history_fallbacks else SourceHealthStatus.HEALTHY
             )
@@ -132,11 +197,25 @@ class HistorySyncService:
                 payload=run.result,
             )
             self.session.commit()
+            self._emit_progress(
+                HistorySyncProgress(
+                    phase="completed",
+                    detail=f"同步完成：确认 {confirmed}，精选 {accepted}，阻断 {len(blocked)}",
+                    current=total,
+                    total=total,
+                    confirmed=confirmed,
+                    accepted=accepted,
+                    blocked=len(blocked),
+                )
+            )
             return run
         except Exception as exc:
             run.status = RunStatus.BLOCKED if isinstance(exc, DataQualityBlocked) else RunStatus.FAILED
             run.blocker = str(exc)
             run.finished_at = utc_now()
+            run.updated_at = run.finished_at
+            run.stage = str(run.status)
+            run.progress_message = str(exc)
             self._set_source_health(
                 "eastmoney",
                 SourceHealthStatus.DEGRADED,
@@ -148,10 +227,16 @@ class HistorySyncService:
                 f"历史/日历同步未完成：{exc}",
             )
             self.session.commit()
+            self._emit_progress(HistorySyncProgress(phase="failed", detail=f"同步未完成：{exc}"))
             return run
         finally:
+            await self.baostock.close()
             await self.eastmoney.close()
             await self.tencent_history.close()
+
+    def _emit_progress(self, progress: HistorySyncProgress) -> None:
+        if self.progress is not None:
+            self.progress(progress)
 
     async def _sync_calendar(self, start: date, end: date) -> None:
         rows = await self.baostock.fetch_calendar(start, end)

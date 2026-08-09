@@ -36,9 +36,10 @@ from app.models import (
 )
 from app.services.audit import append_audit
 from app.services.market_repository import MarketRepository
-from app.services.model import OpenAICompatibleModel, StructuredModel
+from app.services.model import OpenAICompatibleModel, StructuredModel, format_run_failure
 from app.services.preflight import PreflightService
 from app.services.risk import RiskEngine
+from app.services.run_queue import RunProgressReporter
 
 SYSTEM_PROMPT = """你是 Alpha Sage，一个证据优先、会承认不确定性的投资认知 Agent。
 你不是传统因子打分器。你的职责是形成可证伪论点、主动寻找反证、区分三个投资周期，
@@ -62,11 +63,21 @@ class CognitiveAgent:
             self._model = OpenAICompatibleModel(self.session)
         return self._model
 
-    def run_eod(self, trade_date: date) -> AgentRun:
-        run = AgentRun(kind=RunKind.EOD, status=RunStatus.RUNNING, trade_date=trade_date)
-        self.session.add(run)
-        self.session.commit()
+    def run_eod(
+        self,
+        trade_date: date,
+        *,
+        run: AgentRun | None = None,
+        reporter: RunProgressReporter | None = None,
+    ) -> AgentRun:
+        if run is None:
+            run = AgentRun(kind=RunKind.EOD, status=RunStatus.RUNNING, trade_date=trade_date)
+            self.session.add(run)
+            self.session.commit()
+        run.trade_date = trade_date
         try:
+            if reporter:
+                reporter.update("PREFLIGHT", "检查账户、数据、模型和交易规则")
             account = self.session.scalar(select(Account).where(Account.name == "paper-main"))
             if account is None or not account.enabled:
                 return self._block(run, "模拟账户尚未人工启用")
@@ -89,14 +100,34 @@ class CognitiveAgent:
             )
             if champion is None:
                 return self._block(run, "缺少活动冠军策略")
+            if reporter:
+                reporter.update("OPPORTUNITY_DISCOVERY", "识别具备时点数据的研究机会")
             market_regime = self._market_regime(trade_date)
             opportunities = self._discover_opportunities(trade_date, limit=20)
             if not opportunities:
                 return self._block(run, "没有具备时点数据的可研究机会；保持现金")
-            research = [
-                self._research_instrument(run, instrument, trade_date, market_regime, champion)
-                for instrument in opportunities[:8]
-            ]
+            targets = opportunities[:8]
+            research = []
+            for index, instrument in enumerate(targets, start=1):
+                research.append(
+                    self._research_instrument(
+                        run,
+                        instrument,
+                        trade_date,
+                        market_regime,
+                        champion,
+                        reporter=reporter,
+                        index=index,
+                        total=len(targets),
+                    )
+                )
+            if reporter:
+                reporter.update(
+                    "PORTFOLIO_ALLOCATION",
+                    "综合研究结果并生成目标组合",
+                    current=len(targets) * 3,
+                    total=len(targets) * 3 + 1,
+                )
             proposal = self._portfolio_proposal(run, research, market_regime)
             proposal = self.risk.enforce_drawdown_target(proposal, portfolio_state["risk_state"])
             research_by_instrument = {item.instrument_id: item for item in research}
@@ -119,9 +150,13 @@ class CognitiveAgent:
             ]
             if missing_evidence:
                 return self._block(run, f"新开仓缺少可信证据引用：{', '.join(missing_evidence)}")
+            if reporter:
+                reporter.update("RISK_VALIDATION", "执行不可绕过的组合硬风控")
             risk = self.risk.validate_proposal(proposal)
             if not risk.passed:
                 return self._block(run, "组合提案未通过硬风控：" + "; ".join(risk.blockers))
+            if reporter:
+                reporter.update("PERSISTING", "保存研究、决策和模拟订单")
             decisions = self._persist_research(run, research, champion)
             from app.services.evolution import EvolutionService
 
@@ -143,6 +178,11 @@ class CognitiveAgent:
             self.session.add_all(plans)
             run.status = RunStatus.COMPLETED
             run.finished_at = utc_now()
+            run.updated_at = run.finished_at
+            run.stage = "COMPLETED"
+            run.progress_current = len(targets) * 3 + 1
+            run.progress_total = len(targets) * 3 + 1
+            run.progress_message = "盘后研究完成"
             run.input_versions = {
                 "strategy": champion.version,
                 "prompt": self.prompt_version,
@@ -170,9 +210,20 @@ class CognitiveAgent:
             self.session.commit()
             return run
         except Exception as exc:  # noqa: BLE001 - failures are persisted as run evidence
+            failed_stage = run.stage
+            message, result = format_run_failure(
+                self.session,
+                run_id=run.id,
+                stage=failed_stage,
+                exc=exc,
+            )
             run.status = RunStatus.FAILED
-            run.blocker = str(exc)
+            run.blocker = message
             run.finished_at = utc_now()
+            run.updated_at = run.finished_at
+            run.stage = failed_stage or "FAILED"
+            run.progress_message = message
+            run.result = result
             self.session.commit()
             return run
 
@@ -317,6 +368,10 @@ class CognitiveAgent:
         trade_date: date,
         market_regime: str,
         champion: StrategyVersion,
+        *,
+        reporter: RunProgressReporter | None = None,
+        index: int = 1,
+        total: int = 1,
     ) -> ResearchBundle:
         evidence = list(
             self.session.scalars(
@@ -371,6 +426,14 @@ class CognitiveAgent:
             ],
             "champion_rules": champion.rules,
         }
+        base_progress = (index - 1) * 3
+        if reporter:
+            reporter.update(
+                "RESEARCH_THESIS",
+                f"{instrument.symbol} {instrument.name}：生成正方研究",
+                current=base_progress,
+                total=total * 3 + 1,
+            )
         thesis = self.model.complete_json(
             purpose="research-thesis",
             system=SYSTEM_PROMPT,
@@ -378,6 +441,13 @@ class CognitiveAgent:
             schema=ThesisOutput,
             run_id=run.id,
         )
+        if reporter:
+            reporter.update(
+                "RESEARCH_OPPOSITION",
+                f"{instrument.symbol} {instrument.name}：寻找最强反证",
+                current=base_progress + 1,
+                total=total * 3 + 1,
+            )
         opposition = self.model.complete_json(
             purpose="research-opposition",
             system=SYSTEM_PROMPT + "\n此阶段只寻找最强反证，不得迎合正方。",
@@ -389,6 +459,13 @@ class CognitiveAgent:
             schema=OppositionOutput,
             run_id=run.id,
         )
+        if reporter:
+            reporter.update(
+                "RESEARCH_SYNTHESIS",
+                f"{instrument.symbol} {instrument.name}：综合三个周期结论",
+                current=base_progress + 2,
+                total=total * 3 + 1,
+            )
         synthesis = self.model.complete_json(
             purpose="research-synthesis",
             system=SYSTEM_PROMPT + "\n综合正反两方；证据不足时必须 WATCH 或 REJECT。",
@@ -518,6 +595,9 @@ class CognitiveAgent:
         run.status = RunStatus.BLOCKED
         run.blocker = reason
         run.finished_at = utc_now()
+        run.updated_at = run.finished_at
+        run.stage = "BLOCKED"
+        run.progress_message = reason
         run.result = {"cash_is_valid": True}
         self.session.commit()
         return run

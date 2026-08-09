@@ -23,3 +23,21 @@ def test_chinese_experience_search_uses_trigram_tokenizer():
     text = migration.read_text(encoding="utf-8")
     assert "tokenize='trigram'" in text
     assert "SELECT rowid, thesis_summary, tags, market_regime FROM experiences" in text
+
+
+def test_run_feedback_migration_adds_progress_and_failed_model_audit_fields():
+    migration = Path(__file__).parents[1] / "alembic" / "versions" / "0004_run_feedback.py"
+    text = migration.read_text(encoding="utf-8")
+    for field in (
+        "trigger_source",
+        "parameters",
+        "updated_at",
+        "stage",
+        "progress_current",
+        "progress_total",
+        "progress_message",
+    ):
+        assert field in text
+    for field in ("status", "latency_ms", "http_status", "error_type", "error_message"):
+        assert field in text
+    assert "ix_agent_runs_status_started" in text

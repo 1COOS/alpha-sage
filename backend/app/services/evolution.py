@@ -39,6 +39,7 @@ from app.services.agent import SYSTEM_PROMPT
 from app.services.audit import append_audit, stable_hash
 from app.services.market_repository import MarketRepository
 from app.services.model import OpenAICompatibleModel, StructuredModel
+from app.services.run_queue import RunProgressReporter
 
 
 class ExperienceService:
@@ -181,11 +182,21 @@ class EvolutionService:
             self._model = OpenAICompatibleModel(self.session)
         return self._model
 
-    def generate_weekly_lessons(self, week_ending: date | None = None) -> AgentRun:
+    def generate_weekly_lessons(
+        self,
+        week_ending: date | None = None,
+        *,
+        run: AgentRun | None = None,
+        reporter: RunProgressReporter | None = None,
+    ) -> AgentRun:
         week_ending = week_ending or date.today()
-        run = AgentRun(kind=RunKind.WEEKLY, status=RunStatus.RUNNING, trade_date=week_ending)
-        self.session.add(run)
-        self.session.commit()
+        if run is None:
+            run = AgentRun(kind=RunKind.WEEKLY, status=RunStatus.RUNNING, trade_date=week_ending)
+            self.session.add(run)
+            self.session.commit()
+        run.trade_date = week_ending
+        if reporter:
+            reporter.update("COLLECT_EXPERIENCES", "收集最近两周已归因经验")
         experiences = list(
             self.session.scalars(
                 select(Experience)
@@ -195,6 +206,8 @@ class EvolutionService:
         )
         if not experiences:
             return self._block(run, "没有可供周度总结的已归因经验")
+        if reporter:
+            reporter.update("GENERATE_LESSONS", f"基于 {len(experiences)} 条经验生成周度规律")
         output = self.model.complete_json(
             purpose="weekly-lessons",
             system=SYSTEM_PROMPT + "\n只提出可证伪的经验假设，不得将相关性写成确定因果。",
@@ -230,15 +243,28 @@ class EvolutionService:
             )
         run.status = RunStatus.COMPLETED
         run.finished_at = utc_now()
+        run.updated_at = run.finished_at
+        run.stage = "COMPLETED"
+        run.progress_message = "周度规律生成完成"
         run.result = {"lesson_count": len(output.lessons)}
         self.session.commit()
         return run
 
-    def generate_monthly_challenger(self, as_of: date | None = None) -> AgentRun:
+    def generate_monthly_challenger(
+        self,
+        as_of: date | None = None,
+        *,
+        run: AgentRun | None = None,
+        reporter: RunProgressReporter | None = None,
+    ) -> AgentRun:
         as_of = as_of or date.today()
-        run = AgentRun(kind=RunKind.MONTHLY, status=RunStatus.RUNNING, trade_date=as_of)
-        self.session.add(run)
-        self.session.commit()
+        if run is None:
+            run = AgentRun(kind=RunKind.MONTHLY, status=RunStatus.RUNNING, trade_date=as_of)
+            self.session.add(run)
+            self.session.commit()
+        run.trade_date = as_of
+        if reporter:
+            reporter.update("COLLECT_EVIDENCE", "收集经验、规律和独立用户反馈")
         champion = self.session.scalar(select(StrategyVersion).where(StrategyVersion.status == StrategyStatus.CHAMPION))
         experiences = list(self.session.scalars(select(Experience).order_by(Experience.outcome_date.desc()).limit(250)))
         experiences.reverse()
@@ -263,6 +289,8 @@ class EvolutionService:
         )
         if champion is None or len(experiences) < 50 or not lessons:
             return self._block(run, "挑战者至少需要50条已归因经验和一组周度规律候选")
+        if reporter:
+            reporter.update("GENERATE_CHALLENGER", "生成仅包含规则、权重和提示词变化的挑战者")
         candidate = self.model.complete_json(
             purpose="monthly-challenger",
             system=SYSTEM_PROMPT + "\n只能修改经验规则、证据权重和提示词，不得生成或修改代码。",
@@ -307,6 +335,8 @@ class EvolutionService:
             run_id=run.id,
         )
         rules = champion.rules | candidate.rule_changes
+        if reporter:
+            reporter.update("REPLAY", f"在 {len(holdout)} 个冻结留出案例上执行回放")
         strategy = StrategyVersion(
             version=f"challenger-{as_of.isoformat()}-{stable_hash(rules)[:8]}",
             status=StrategyStatus.CHALLENGER,
@@ -339,6 +369,9 @@ class EvolutionService:
             item.used_for_challenger = True
         run.status = RunStatus.COMPLETED
         run.finished_at = utc_now()
+        run.updated_at = run.finished_at
+        run.stage = "COMPLETED"
+        run.progress_message = "月度挑战者生成完成"
         run.result = {"challenger_report_id": report.id, "status": report.status}
         self.session.commit()
         return run
@@ -547,5 +580,8 @@ class EvolutionService:
         run.status = RunStatus.BLOCKED
         run.blocker = reason
         run.finished_at = utc_now()
+        run.updated_at = run.finished_at
+        run.stage = "BLOCKED"
+        run.progress_message = reason
         self.session.commit()
         return run

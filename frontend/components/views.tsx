@@ -4,6 +4,10 @@ import { FormEvent, useEffect, useState } from "react";
 import { API_BASE, api, money, percent } from "@/lib/api";
 import type {
   ActionRunner,
+  ActionFeedbackMap,
+  ActionFeedbackSummary,
+  AgentRun,
+  BusyActions,
   Challenger,
   Experience,
   Fill,
@@ -20,11 +24,17 @@ export function TodayView({
   portfolio,
   research,
   onAction,
+  busyActions,
+  feedbackByAction,
+  onOpenTaskCenter,
 }: {
   status: SystemStatus | null;
   portfolio: Portfolio | null;
   research: Research[];
   onAction: ActionRunner;
+  busyActions: BusyActions;
+  feedbackByAction: ActionFeedbackMap;
+  onOpenTaskCenter: () => void;
 }) {
   const cashRatio = portfolio
     ? Number(portfolio.cash) / Number(portfolio.equity || 1)
@@ -75,35 +85,49 @@ export function TodayView({
           <div className="button-row">
             <button
               className="primary"
+              disabled={busyActions.has("盘后研究")}
               onClick={() =>
                 void onAction("盘后研究", () =>
                   api("/agent/eod", { method: "POST" }),
                 )
               }
             >
-              运行盘后研究
+              {busyActions.has("盘后研究") ? "盘后研究执行中…" : "运行盘后研究"}
             </button>
             <button
               className="ghost"
+              disabled={busyActions.has("盘中复核")}
               onClick={() =>
                 void onAction("盘中复核", () =>
                   api("/agent/intraday", { method: "POST" }),
                 )
               }
             >
-              运行盘中复核
+              {busyActions.has("盘中复核") ? "盘中复核执行中…" : "运行盘中复核"}
             </button>
             <button
               className="ghost"
+              disabled={busyActions.has("经验归因")}
               onClick={() =>
                 void onAction("经验归因", () =>
                   api("/agent/attribute", { method: "POST" }),
                 )
               }
             >
-              更新归因
+              {busyActions.has("经验归因") ? "归因执行中…" : "更新归因"}
             </button>
           </div>
+          <InlineActionFeedback
+            labels={["盘后研究", "盘中复核", "经验归因"]}
+            feedbackByAction={feedbackByAction}
+            onOpenTaskCenter={onOpenTaskCenter}
+          />
+          {status?.last_run && (
+            <div className={`inline-action-status ${String(status.last_run.status).toLowerCase()}`}>
+              <strong>最近任务：{String(status.last_run.kind)}</strong>
+              <span>{String(status.last_run.progress_message ?? status.last_run.blocker ?? status.last_run.status)}</span>
+            </div>
+          )}
         </article>
 
         <article className="panel">
@@ -341,10 +365,16 @@ export function MemoryView({
   experiences,
   lessons,
   onAction,
+  busyActions,
+  feedbackByAction,
+  onOpenTaskCenter,
 }: {
   experiences: Experience[];
   lessons: Lesson[];
   onAction: ActionRunner;
+  busyActions: BusyActions;
+  feedbackByAction: ActionFeedbackMap;
+  onOpenTaskCenter: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [searchRows, setSearchRows] = useState<Experience[] | null>(null);
@@ -408,14 +438,20 @@ export function MemoryView({
         {!lessons.length && <Empty text="至少需要一批已归因经验" />}
         <button
           className="ghost wide"
+          disabled={busyActions.has("周度总结")}
           onClick={() =>
             void onAction("周度总结", () =>
               api("/evolution/weekly", { method: "POST" }),
             )
           }
         >
-          生成周度规律
+          {busyActions.has("周度总结") ? "周度总结执行中…" : "生成周度规律"}
         </button>
+        <InlineActionFeedback
+          labels={["周度总结"]}
+          feedbackByAction={feedbackByAction}
+          onOpenTaskCenter={onOpenTaskCenter}
+        />
         <div className="feedback-box">
           <label>
             用户反馈（独立经验源）
@@ -427,7 +463,7 @@ export function MemoryView({
           </label>
           <button
             className="ghost wide"
-            disabled={feedback.trim().length < 2}
+            disabled={feedback.trim().length < 2 || busyActions.has("保存反馈")}
             onClick={() =>
               void onAction("保存反馈", async () => {
                 await api("/feedback", {
@@ -442,8 +478,13 @@ export function MemoryView({
               })
             }
           >
-            保存为经验来源
+            {busyActions.has("保存反馈") ? "保存中…" : "保存为经验来源"}
           </button>
+          <InlineActionFeedback
+            labels={["保存反馈"]}
+            feedbackByAction={feedbackByAction}
+            onOpenTaskCenter={onOpenTaskCenter}
+          />
         </div>
       </article>
     </div>
@@ -453,9 +494,15 @@ export function MemoryView({
 export function EvolutionView({
   rows,
   onAction,
+  busyActions,
+  feedbackByAction,
+  onOpenTaskCenter,
 }: {
   rows: Challenger[];
   onAction: ActionRunner;
+  busyActions: BusyActions;
+  feedbackByAction: ActionFeedbackMap;
+  onOpenTaskCenter: () => void;
 }) {
   return (
     <div className="dashboard-grid">
@@ -467,16 +514,18 @@ export function EvolutionView({
         <div className="button-row">
           <button
             className="primary"
+            disabled={busyActions.has("月度挑战者")}
             onClick={() =>
               void onAction("月度挑战者", () =>
                 api("/evolution/monthly", { method: "POST" }),
               )
             }
           >
-            生成月度挑战者
+            {busyActions.has("月度挑战者") ? "挑战者生成中…" : "生成月度挑战者"}
           </button>
           <button
             className="danger"
+            disabled={busyActions.has("回滚冠军")}
             onClick={() =>
               void onAction("回滚冠军", () =>
                 api(`/evolution/rollback?reason=${encodeURIComponent("用户从进化中心人工回滚")}`, {
@@ -485,9 +534,14 @@ export function EvolutionView({
               )
             }
           >
-            人工回滚冠军
+            {busyActions.has("回滚冠军") ? "回滚中…" : "人工回滚冠军"}
           </button>
         </div>
+        <InlineActionFeedback
+          labels={["月度挑战者", "回滚冠军", "批准挑战者"]}
+          feedbackByAction={feedbackByAction}
+          onOpenTaskCenter={onOpenTaskCenter}
+        />
         {rows.length ? (
           <div className="challenger-grid">
             {rows.map((row) => (
@@ -517,6 +571,7 @@ export function EvolutionView({
                 {row.status === "ELIGIBLE" && (
                   <button
                     className="primary wide"
+                    disabled={busyActions.has("批准挑战者")}
                     onClick={() =>
                       void onAction("批准挑战者", () =>
                         api(`/evolution/challengers/${row.id}/approve`, {
@@ -528,7 +583,7 @@ export function EvolutionView({
                       )
                     }
                   >
-                    人工批准晋升
+                    {busyActions.has("批准挑战者") ? "批准中…" : "人工批准晋升"}
                   </button>
                 )}
               </div>
@@ -637,40 +692,71 @@ export function ChatView() {
 export function SettingsView({
   sources,
   onAction,
+  busyActions,
+  latestModelTest,
+  feedbackByAction,
+  onOpenTaskCenter,
 }: {
   sources: SourceHealth[];
   onAction: ActionRunner;
+  busyActions: BusyActions;
+  latestModelTest: AgentRun | null;
+  feedbackByAction: ActionFeedbackMap;
+  onOpenTaskCenter: () => void;
 }) {
   const [form, setForm] = useState({
-    base_url: "https://api.openai.com/v1",
+    base_url: "",
     api_mode: "responses",
-    reasoning_model: "gpt-5.2",
-    fast_model: "gpt-5-mini",
-    daily_request_budget: "100",
+    reasoning_model: "",
+    fast_model: "",
+    daily_request_budget: "",
     api_key: "",
   });
+  const [savedForm, setSavedForm] = useState<typeof form | null>(null);
+  const [apiKeyConfigured, setApiKeyConfigured] = useState(false);
+  const [settingsError, setSettingsError] = useState("");
 
   useEffect(() => {
-    void api<Record<string, string | boolean>>("/settings/model")
-      .then((value) =>
-        setForm((current) => ({
-          ...current,
-          base_url: String(value.base_url ?? current.base_url),
-          api_mode: String(value.api_mode ?? current.api_mode),
-          reasoning_model: String(value.reasoning_model ?? current.reasoning_model),
-          fast_model: String(value.fast_model ?? current.fast_model),
-          daily_request_budget: String(
-            value.daily_request_budget ?? current.daily_request_budget,
-          ),
-        })),
-      )
-      .catch(() => undefined);
+    void api<Record<string, unknown>>("/settings/model")
+      .then((value) => {
+        const loaded = {
+          base_url: String(value.base_url ?? ""),
+          api_mode: String(value.api_mode ?? "responses"),
+          reasoning_model: String(value.reasoning_model ?? ""),
+          fast_model: String(value.fast_model ?? ""),
+          daily_request_budget: String(value.daily_request_budget ?? "100"),
+          api_key: "",
+        };
+        setForm(loaded);
+        setSavedForm(loaded);
+        setApiKeyConfigured(Boolean(value.api_key_configured));
+        setSettingsError("");
+      })
+      .catch((error) => setSettingsError(error instanceof Error ? error.message : "模型设置加载失败"));
   }, []);
+
+  const comparable = (value: typeof form) => JSON.stringify({ ...value, api_key: "" });
+  const dirty = Boolean(
+    savedForm && (comparable(form) !== comparable(savedForm) || form.api_key.trim()),
+  );
+  const canTest =
+    Boolean(form.base_url.trim() && form.reasoning_model.trim() && form.fast_model.trim()) &&
+    (apiKeyConfigured || Boolean(form.api_key.trim()));
+  const testChecks = Array.isArray(latestModelTest?.result?.checks)
+    ? (latestModelTest.result.checks as Array<Record<string, unknown>>)
+    : [];
 
   return (
     <div className="dashboard-grid">
       <article className="panel span-2">
         <PanelHead title="模型路由" meta="OPENAI COMPATIBLE / LOCAL SECRET" />
+        {settingsError && <div className="inline-action-status failed">{settingsError}</div>}
+        <div className="settings-state-row">
+          <span className={`pill ${apiKeyConfigured ? "completed" : "failed"}`}>
+            API Key {apiKeyConfigured ? "已配置" : "未配置"}
+          </span>
+          {dirty && <span className="pill warning">存在未保存修改</span>}
+        </div>
         <div className="form-grid">
           <label>
             Base URL
@@ -723,22 +809,83 @@ export function SettingsView({
               type="password"
               value={form.api_key}
               onChange={(event) => setForm({ ...form, api_key: event.target.value })}
+              placeholder={apiKeyConfigured ? "已配置；留空表示继续使用现有密钥" : "请输入 API Key"}
             />
           </label>
         </div>
-        <button
-          className="primary"
-          onClick={() =>
-            void onAction("保存模型设置", () =>
-              api("/settings/model", {
-                method: "PUT",
-                body: JSON.stringify(form),
-              }),
-            )
-          }
-        >
-          保存设置
-        </button>
+        <div className="button-row">
+          <button
+            className="primary"
+            disabled={busyActions.has("保存模型设置") || !dirty}
+            onClick={() =>
+              void onAction("保存模型设置", async () => {
+                const value = await api<Record<string, unknown>>("/settings/model", {
+                  method: "PUT",
+                  body: JSON.stringify(form),
+                });
+                const saved = { ...form, api_key: "" };
+                setForm(saved);
+                setSavedForm(saved);
+                setApiKeyConfigured(Boolean(value.api_key_configured));
+                return value;
+              })
+            }
+          >
+            {busyActions.has("保存模型设置") ? "保存中…" : "保存设置"}
+          </button>
+          <button
+            className="ghost"
+            disabled={!canTest || busyActions.has("测试模型连接")}
+            onClick={() =>
+              void onAction("测试模型连接", () =>
+                api("/settings/model/test", {
+                  method: "POST",
+                  body: JSON.stringify({
+                    ...form,
+                    daily_request_budget: Number(form.daily_request_budget),
+                  }),
+                }),
+              )
+            }
+          >
+            {busyActions.has("测试模型连接") ? "正在测试两个模型…" : "测试连接"}
+          </button>
+        </div>
+        <InlineActionFeedback
+          labels={["保存模型设置", "测试模型连接"]}
+          feedbackByAction={feedbackByAction}
+          onOpenTaskCenter={onOpenTaskCenter}
+        />
+        {!canTest && (
+          <p className="muted">测试需要完整的 Base URL、两个模型名，以及已保存或当前输入的 API Key。</p>
+        )}
+        {latestModelTest && (
+          <div className="model-test-results">
+            <div className="inline-action-status">
+              <strong>最近模型测试：{latestModelTest.status}</strong>
+              <span>{latestModelTest.progress_message ?? latestModelTest.blocker ?? "等待结果"}</span>
+            </div>
+            {testChecks.map((check) => (
+              <div className={`model-test-card ${String(check.status).toLowerCase()}`} key={String(check.role)}>
+                <div>
+                  <span className={`pill ${String(check.status).toLowerCase()}`}>{String(check.status)}</span>
+                  <strong>{check.role === "reasoning" ? "推理模型" : "快速模型"}</strong>
+                </div>
+                <p>{String(check.model ?? "")}</p>
+                <small>{String(check.message ?? "")}</small>
+                <small className="model-test-meta">
+                  {String(check.endpoint ?? "")}
+                  {check.http_status ? ` · HTTP ${String(check.http_status)}` : ""}
+                  {check.error_type ? ` · ${String(check.error_type)}` : ""}
+                  {` · ${String(check.latency_ms ?? 0)}ms`}
+                </small>
+                {Boolean(check.request_id) && (
+                  <small className="model-test-meta">Request ID: {String(check.request_id)}</small>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </article>
       <article className="panel">
         <PanelHead title="数据初始化" meta="5 YEARS / DUAL SOURCE" />
@@ -748,25 +895,32 @@ export function SettingsView({
         <div className="button-stack">
           <button
             className="primary wide"
+            disabled={busyActions.has("五年历史同步")}
             onClick={() =>
               void onAction("五年历史同步", () =>
                 api("/data/sync-history?years=5", { method: "POST" }),
               )
             }
           >
-            同步完整五年历史
+            {busyActions.has("五年历史同步") ? "历史同步执行中…" : "同步完整五年历史"}
           </button>
           <button
             className="ghost wide"
+            disabled={busyActions.has("小规模数据验证")}
             onClick={() =>
               void onAction("小规模数据验证", () =>
                 api("/data/sync-history?years=5&limit=10", { method: "POST" }),
               )
             }
           >
-            先验证 10 个标的
+            {busyActions.has("小规模数据验证") ? "数据验证执行中…" : "先验证 10 个标的"}
           </button>
         </div>
+        <InlineActionFeedback
+          labels={["五年历史同步", "小规模数据验证"]}
+          feedbackByAction={feedbackByAction}
+          onOpenTaskCenter={onOpenTaskCenter}
+        />
       </article>
       <article className="panel span-3">
         <PanelHead title="来源注册表" meta="NO SLA / EXPLICIT HEALTH" />
@@ -783,6 +937,36 @@ export function SettingsView({
           ))}
         </div>
       </article>
+    </div>
+  );
+}
+
+function InlineActionFeedback({
+  labels,
+  feedbackByAction,
+  onOpenTaskCenter,
+}: {
+  labels: string[];
+  feedbackByAction: ActionFeedbackMap;
+  onOpenTaskCenter: () => void;
+}) {
+  const items = labels
+    .map((label) => feedbackByAction.get(label))
+    .filter((item): item is ActionFeedbackSummary => Boolean(item));
+  if (!items.length) return null;
+  return (
+    <div className="inline-action-feedback-list">
+      {items.map((item) => (
+        <button
+          className={`inline-action-status ${item.status.toLowerCase()}`}
+          key={item.id}
+          onClick={onOpenTaskCenter}
+        >
+          <strong>{item.label} · {item.status}</strong>
+          <span>{item.stage ? `${item.stage} · ` : ""}{item.message}</span>
+          <small>打开任务详情</small>
+        </button>
+      ))}
     </div>
   );
 }

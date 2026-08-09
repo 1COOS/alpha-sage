@@ -13,6 +13,8 @@ class RunKind(StrEnum):
     WEEKLY = "WEEKLY"
     MONTHLY = "MONTHLY"
     DATA_SYNC = "DATA_SYNC"
+    ATTRIBUTION = "ATTRIBUTION"
+    MODEL_TEST = "MODEL_TEST"
 
 
 class RunStatus(StrEnum):
@@ -21,6 +23,7 @@ class RunStatus(StrEnum):
     COMPLETED = "COMPLETED"
     BLOCKED = "BLOCKED"
     FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
 
 
 class DecisionAction(StrEnum):

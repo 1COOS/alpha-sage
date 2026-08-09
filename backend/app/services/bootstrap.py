@@ -177,20 +177,15 @@ def bootstrap_system(session: Session) -> Account:
             "manual_enable_required": True,
             "runtime_code_mutation": False,
         },
-        "model_settings": {
-            "api_mode": "responses",
-            "reasoning_model": "gpt-5.2",
-            "fast_model": "gpt-5-mini",
-            "daily_request_budget": 100,
-        },
+        # Runtime model values come from environment defaults until the user
+        # explicitly saves UI overrides. Never seed values that permanently
+        # mask later .env changes.
+        "model_settings": {},
     }
     for key, value in defaults.items():
         existing = session.get(SystemSetting, key)
         if existing is None:
             session.add(SystemSetting(key=key, value=value))
-        elif key == "model_settings":
-            existing.value = value | existing.value
-            existing.updated_at = now
 
     session.commit()
     return account
