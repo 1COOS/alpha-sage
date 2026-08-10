@@ -5,10 +5,12 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.domain.enums import (
+    ChallengerStatus,
     DecisionAction,
     Horizon,
     RunKind,
@@ -25,16 +27,18 @@ from app.domain.schemas import (
 from app.models import (
     Account,
     AgentRun,
+    ChallengerReport,
     DecisionRevision,
     EvidenceRef,
     Experience,
     Instrument,
     PositionLot,
     ResearchDossier,
+    ResearchPhaseCheckpoint,
     StrategyVersion,
     utc_now,
 )
-from app.services.audit import append_audit
+from app.services.audit import append_audit, stable_hash
 from app.services.market_repository import MarketRepository
 from app.services.model import OpenAICompatibleModel, StructuredModel, format_run_failure
 from app.services.preflight import PreflightService
@@ -49,7 +53,8 @@ SYSTEM_PROMPT = """你是 Alpha Sage，一个证据优先、会承认不确定�
 
 
 class CognitiveAgent:
-    prompt_version = "cognition-v1"
+    prompt_version = "cognition-v2"
+    research_schema_version = "research-contract-v2"
 
     def __init__(self, session: Session, model: StructuredModel | None = None):
         self.session = session
@@ -57,6 +62,7 @@ class CognitiveAgent:
         self._model = model
         self.market = MarketRepository(session)
         self.risk = RiskEngine(session)
+        self._checkpoint_stats = {"generated": 0, "reused": 0}
 
     @property
     def model(self) -> StructuredModel:
@@ -157,11 +163,13 @@ class CognitiveAgent:
             if not risk.passed:
                 return self._block(run, "组合提案未通过硬风控：" + "; ".join(risk.blockers))
             if reporter:
-                reporter.update("PERSISTING", "保存研究、决策和模拟订单")
-            decisions = self._persist_research(run, research, champion)
-            from app.services.evolution import EvolutionService
-
-            shadow_decision_count = EvolutionService(self.session, self.model).create_shadow_decisions(run)
+                reporter.update(
+                    "CHALLENGER_SHADOW",
+                    "生成挑战者影子结论",
+                    current=len(targets) * 3,
+                    total=len(targets) * 3 + 1,
+                )
+            shadow_drafts = self._prepare_shadow_decisions(run, research)
             instruments = list(
                 self.session.scalars(
                     select(Instrument).where(
@@ -170,6 +178,10 @@ class CognitiveAgent:
                 )
             )
             prices = self.market.price_map(instruments)
+            if reporter:
+                reporter.update("PERSISTING", "原子保存研究、决策和模拟订单")
+            decisions, dossiers = self._persist_research(run, research, champion)
+            shadow_decision_count = self._persist_shadow_decisions(shadow_drafts, dossiers)
             plans = self.risk.build_orders(
                 account=account,
                 proposal=proposal,
@@ -199,6 +211,10 @@ class CognitiveAgent:
                 "order_count": len(plans),
                 "cash_weight": str(proposal.cash_weight),
                 "risk_warnings": risk.warnings,
+                "checkpoint_summary": {
+                    "available": self._checkpoint_stats["generated"] + self._checkpoint_stats["reused"],
+                    **self._checkpoint_stats,
+                },
             }
             append_audit(
                 self.session,
@@ -212,12 +228,22 @@ class CognitiveAgent:
             return run
         except Exception as exc:  # noqa: BLE001 - failures are persisted as run evidence
             failed_stage = run.stage
+            run_id = run.id
+            if failed_stage == "PERSISTING":
+                self.session.rollback()
+                run = self.session.get(AgentRun, run_id)
+                if run is None:
+                    raise
             message, result = format_run_failure(
                 self.session,
                 run_id=run.id,
                 stage=failed_stage,
                 exc=exc,
             )
+            result["checkpoint_summary"] = {
+                "available": self._checkpoint_stats["generated"] + self._checkpoint_stats["reused"],
+                **self._checkpoint_stats,
+            }
             run.status = RunStatus.FAILED
             run.blocker = message
             run.finished_at = utc_now()
@@ -435,12 +461,15 @@ class CognitiveAgent:
                 current=base_progress,
                 total=total * 3 + 1,
             )
-        thesis = self.model.complete_json(
+        thesis = self._checkpointed_json(
+            run=run,
+            instrument=instrument,
+            checkpoint_key="THESIS",
             purpose="research-thesis",
             system=SYSTEM_PROMPT,
             user=json.dumps(context, ensure_ascii=False, default=str),
             schema=ThesisOutput,
-            run_id=run.id,
+            strategy_version=champion.version,
         )
         if reporter:
             reporter.update(
@@ -449,16 +478,20 @@ class CognitiveAgent:
                 current=base_progress + 1,
                 total=total * 3 + 1,
             )
-        opposition = self.model.complete_json(
+        opposition_user = json.dumps(
+            {"context": context, "thesis": thesis.model_dump(mode="json")},
+            ensure_ascii=False,
+            default=str,
+        )
+        opposition = self._checkpointed_json(
+            run=run,
+            instrument=instrument,
+            checkpoint_key="OPPOSITION",
             purpose="research-opposition",
             system=SYSTEM_PROMPT + "\n此阶段只寻找最强反证，不得迎合正方。",
-            user=json.dumps(
-                {"context": context, "thesis": thesis.model_dump(mode="json")},
-                ensure_ascii=False,
-                default=str,
-            ),
+            user=opposition_user,
             schema=OppositionOutput,
-            run_id=run.id,
+            strategy_version=champion.version,
         )
         if reporter:
             reporter.update(
@@ -467,20 +500,24 @@ class CognitiveAgent:
                 current=base_progress + 2,
                 total=total * 3 + 1,
             )
-        synthesis = self.model.complete_json(
+        synthesis_user = json.dumps(
+            {
+                "context": context,
+                "thesis": thesis.model_dump(mode="json"),
+                "opposition": opposition.model_dump(mode="json"),
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+        synthesis = self._checkpointed_json(
+            run=run,
+            instrument=instrument,
+            checkpoint_key="SYNTHESIS",
             purpose="research-synthesis",
             system=SYSTEM_PROMPT + "\n综合正反两方；证据不足时必须 WATCH 或 REJECT。",
-            user=json.dumps(
-                {
-                    "context": context,
-                    "thesis": thesis.model_dump(mode="json"),
-                    "opposition": opposition.model_dump(mode="json"),
-                },
-                ensure_ascii=False,
-                default=str,
-            ),
+            user=synthesis_user,
             schema=SynthesisOutput,
-            run_id=run.id,
+            strategy_version=champion.version,
         )
         return ResearchBundle(
             instrument_id=instrument.id,
@@ -491,6 +528,118 @@ class CognitiveAgent:
             synthesis=synthesis,
             evidence_ids=[item.id for item in evidence],
         )
+
+    def _checkpointed_json(
+        self,
+        *,
+        run: AgentRun,
+        instrument: Instrument,
+        checkpoint_key: str,
+        purpose: str,
+        system: str,
+        user: str,
+        schema: type[BaseModel],
+        strategy_version: str,
+    ) -> BaseModel:
+        if run.trade_date is None:
+            raise ValueError("盘后研究 checkpoint 缺少交易日")
+        provider = str(getattr(self.model, "base_url", "injected"))
+        fingerprint = stable_hash(
+            {
+                "provider": provider,
+                "api_mode": str(getattr(self.model, "api_mode", "injected")),
+                "model": self.model.model_name,
+                "prompt_version": self.prompt_version,
+                "schema_version": self.research_schema_version,
+                "strategy_version": strategy_version,
+                "checkpoint_key": checkpoint_key,
+                "system": system,
+                "user": user,
+                "schema": schema.model_json_schema(),
+            }
+        )
+        source = self._find_source_checkpoint(run, instrument.id, checkpoint_key)
+        if (
+            source is not None
+            and source.input_hash == fingerprint
+            and source.output_hash == stable_hash(source.output_json)
+        ):
+            try:
+                parsed = schema.model_validate(source.output_json)
+            except ValidationError:
+                source = None
+            else:
+                checkpoint = ResearchPhaseCheckpoint(
+                    run_id=run.id,
+                    source_checkpoint_id=source.id,
+                    instrument_id=instrument.id,
+                    trade_date=run.trade_date,
+                    checkpoint_key=checkpoint_key,
+                    input_hash=fingerprint,
+                    output_hash=stable_hash(parsed.model_dump(mode="json")),
+                    output_json=parsed.model_dump(mode="json"),
+                    model_invocation_id=None,
+                    provider=provider,
+                    model_version=self.model.model_name,
+                    prompt_version=self.prompt_version,
+                    schema_version=self.research_schema_version,
+                    strategy_version=strategy_version,
+                )
+                self.session.add(checkpoint)
+                self.session.commit()
+                self._checkpoint_stats["reused"] += 1
+                return parsed
+
+        parsed = self.model.complete_json(
+            purpose=purpose,
+            system=system,
+            user=user,
+            schema=schema,
+            run_id=run.id,
+        )
+        checkpoint = ResearchPhaseCheckpoint(
+            run_id=run.id,
+            source_checkpoint_id=None,
+            instrument_id=instrument.id,
+            trade_date=run.trade_date,
+            checkpoint_key=checkpoint_key,
+            input_hash=fingerprint,
+            output_hash=stable_hash(parsed.model_dump(mode="json")),
+            output_json=parsed.model_dump(mode="json"),
+            model_invocation_id=getattr(self.model, "last_call_metadata", {}).get("invocation_id"),
+            provider=provider,
+            model_version=self.model.model_name,
+            prompt_version=self.prompt_version,
+            schema_version=self.research_schema_version,
+            strategy_version=strategy_version,
+        )
+        self.session.add(checkpoint)
+        self.session.commit()
+        self._checkpoint_stats["generated"] += 1
+        return parsed
+
+    def _find_source_checkpoint(
+        self,
+        run: AgentRun,
+        instrument_id: str,
+        checkpoint_key: str,
+    ) -> ResearchPhaseCheckpoint | None:
+        source_run_id = run.resumed_from_run_id
+        visited: set[str] = set()
+        while source_run_id and source_run_id not in visited:
+            visited.add(source_run_id)
+            checkpoint = self.session.scalar(
+                select(ResearchPhaseCheckpoint).where(
+                    ResearchPhaseCheckpoint.run_id == source_run_id,
+                    ResearchPhaseCheckpoint.instrument_id == instrument_id,
+                    ResearchPhaseCheckpoint.checkpoint_key == checkpoint_key,
+                )
+            )
+            if checkpoint is not None:
+                return checkpoint
+            source_run = self.session.get(AgentRun, source_run_id)
+            source_run_id = source_run.resumed_from_run_id if source_run is not None else None
+        return None
 
     def _portfolio_proposal(
         self,
@@ -535,13 +684,59 @@ class CognitiveAgent:
             run_id=run.id,
         )
 
+    def _prepare_shadow_decisions(
+        self,
+        run: AgentRun,
+        research: list[ResearchBundle],
+    ) -> list[tuple[StrategyVersion, ResearchBundle, SynthesisOutput]]:
+        reports = list(
+            self.session.scalars(select(ChallengerReport).where(ChallengerReport.status == ChallengerStatus.SHADOW))
+        )
+        instruments = {
+            item.id: item
+            for item in self.session.scalars(
+                select(Instrument).where(Instrument.id.in_({item.instrument_id for item in research}))
+            )
+        }
+        drafts: list[tuple[StrategyVersion, ResearchBundle, SynthesisOutput]] = []
+        for report in reports:
+            strategy = self.session.get(StrategyVersion, report.strategy_version_id)
+            if strategy is None:
+                continue
+            for item in research:
+                instrument = instruments.get(item.instrument_id)
+                if instrument is None:
+                    raise ValueError(f"影子决策缺少标的：{item.instrument_id}")
+                user = json.dumps(
+                    {
+                        "thesis": item.thesis.model_dump(mode="json"),
+                        "opposition": item.opposition.model_dump(mode="json"),
+                        "candidate_rules": strategy.rules,
+                        "prompt_overrides": strategy.prompt_overrides,
+                    },
+                    ensure_ascii=False,
+                )
+                synthesis = self._checkpointed_json(
+                    run=run,
+                    instrument=instrument,
+                    checkpoint_key=f"SHADOW_SYNTHESIS:{strategy.id}",
+                    purpose="challenger-shadow-decision",
+                    system=SYSTEM_PROMPT + "\n这是挑战者影子决策，不得创建真实或模拟订单。",
+                    user=user,
+                    schema=SynthesisOutput,
+                    strategy_version=strategy.version,
+                )
+                drafts.append((strategy, item, synthesis))
+        return drafts
+
     def _persist_research(
         self,
         run: AgentRun,
         research: list[ResearchBundle],
         champion: StrategyVersion,
-    ) -> dict[tuple[str, Horizon], DecisionRevision]:
+    ) -> tuple[dict[tuple[str, Horizon], DecisionRevision], dict[str, ResearchDossier]]:
         decisions: dict[tuple[str, Horizon], DecisionRevision] = {}
+        dossiers: dict[str, ResearchDossier] = {}
         for item in research:
             dossier = ResearchDossier(
                 run_id=run.id,
@@ -566,6 +761,7 @@ class CognitiveAgent:
             )
             self.session.add(dossier)
             self.session.flush()
+            dossiers[item.instrument_id] = dossier
             for view in item.synthesis.horizon_views:
                 decision = DecisionRevision(
                     decision_key=f"{item.instrument_id}:{item.trade_date}:{view.horizon}",
@@ -590,7 +786,44 @@ class CognitiveAgent:
                 self.session.add(decision)
                 decisions[(item.instrument_id, view.horizon)] = decision
         self.session.flush()
-        return decisions
+        return decisions, dossiers
+
+    def _persist_shadow_decisions(
+        self,
+        drafts: list[tuple[StrategyVersion, ResearchBundle, SynthesisOutput]],
+        dossiers: dict[str, ResearchDossier],
+    ) -> int:
+        count = 0
+        for strategy, item, synthesis in drafts:
+            dossier = dossiers.get(item.instrument_id)
+            if dossier is None:
+                raise ValueError(f"影子决策缺少研究档案：{item.instrument_id}")
+            for view in synthesis.horizon_views:
+                self.session.add(
+                    DecisionRevision(
+                        decision_key=f"shadow:{strategy.id}:{dossier.instrument_id}:{dossier.trade_date}:{view.horizon}",
+                        revision=1,
+                        dossier_id=dossier.id,
+                        instrument_id=dossier.instrument_id,
+                        horizon=view.horizon,
+                        action=view.action,
+                        target_weight=view.target_weight,
+                        expected_return_low=view.expected_return_low,
+                        expected_return_high=view.expected_return_high,
+                        probability_up=view.probability_up,
+                        confidence=view.confidence,
+                        holding_days=view.holding_days,
+                        rationale=view.rationale,
+                        risks=view.risks,
+                        trigger_reason="CHALLENGER_SHADOW",
+                        evidence_ids=dossier.evidence_ids,
+                        strategy_version_id=strategy.id,
+                        risk_version=self.risk.version,
+                    )
+                )
+                count += 1
+        self.session.flush()
+        return count
 
     def _block(self, run: AgentRun, reason: str) -> AgentRun:
         run.status = RunStatus.BLOCKED

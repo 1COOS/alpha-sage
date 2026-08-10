@@ -231,4 +231,72 @@ describe("DashboardShell", () => {
     expect(screen.getByText(/HTTP 403 · provider_blocked/)).toBeInTheDocument();
     expect(screen.getByText(/Request ID: req-fast-blocked/)).toBeInTheDocument();
   });
+
+  it("offers manual EOD resume and distinguishes reusable checkpoints", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/agent/runs/run_failed_checkpoint/resume") && init?.method === "POST") {
+          return response({
+            run_id: "run_resumed",
+            kind: "EOD",
+            status: "PENDING",
+            stage: "QUEUED",
+            message: "等待前序任务完成",
+            resumed_from_run_id: "run_failed_checkpoint",
+          });
+        }
+        if (url.includes("/agent/runs")) {
+          return response([
+            {
+              id: "run_failed_checkpoint",
+              kind: "EOD",
+              status: "FAILED",
+              trigger_source: "MANUAL",
+              parameters: {},
+              stage: "RESEARCH_SYNTHESIS",
+              progress_message: "模型输出不符合契约",
+              result: {},
+              checkpoint_summary: { available: 5, generated: 5, reused: 0 },
+              started_at: "2026-08-10T03:00:00Z",
+              finished_at: "2026-08-10T03:10:00Z",
+            },
+            {
+              id: "run_failed_legacy",
+              kind: "EOD",
+              status: "FAILED",
+              trigger_source: "MANUAL",
+              parameters: {},
+              stage: "RESEARCH_THESIS",
+              progress_message: "旧任务失败",
+              result: {},
+              checkpoint_summary: { available: 0, generated: 0, reused: 0 },
+              started_at: "2026-08-10T02:00:00Z",
+              finished_at: "2026-08-10T02:10:00Z",
+            },
+          ]);
+        }
+        return response(basePayload(url));
+      }),
+    );
+
+    render(<DashboardShell />);
+    fireEvent.click(screen.getByRole("button", { name: /任务中心/ }));
+
+    expect(await screen.findByRole("button", { name: "继续运行" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重新运行" })).toBeInTheDocument();
+    expect(screen.getByText(/checkpoint 5 · 新生成 5 · 复用 0/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "继续运行" }));
+    await waitFor(() => {
+      const calls = (fetch as ReturnType<typeof vi.fn>).mock.calls;
+      expect(
+        calls.some(
+          ([url, init]) =>
+            String(url).endsWith("/agent/runs/run_failed_checkpoint/resume") && init?.method === "POST",
+        ),
+      ).toBe(true);
+    });
+  });
 });

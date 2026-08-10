@@ -1,3 +1,5 @@
+from datetime import date
+
 import httpx
 from fastapi import FastAPI
 from sqlalchemy import text
@@ -5,8 +7,8 @@ from sqlalchemy import text
 from app.api import routes
 from app.api.routes import router
 from app.db import get_session
-from app.domain.enums import RunStatus
-from app.models import AgentRun
+from app.domain.enums import RunKind, RunStatus
+from app.models import AgentRun, Instrument, ResearchPhaseCheckpoint
 
 
 async def test_status_and_agent_submission_do_not_require_model_key(session, monkeypatch):
@@ -130,3 +132,111 @@ async def test_model_connection_test_queues_current_form_without_persisting_key(
     assert captured["parameters"]["reasoning_model"] == "reasoning-current-form"
     assert captured["parameters"]["api_key_supplied"] is True
     assert "api_key" not in captured["parameters"]
+
+
+async def test_failed_eod_can_resume_as_a_new_linked_run(session, monkeypatch):
+    source = AgentRun(kind=RunKind.EOD, status=RunStatus.FAILED, trade_date=date.today())
+    session.add(source)
+    session.commit()
+    captured = {}
+
+    class FakeQueue:
+        def submit(self, **kwargs):
+            captured.update(kwargs)
+            return AgentRun(
+                id="run_resumed",
+                kind=kwargs["kind"],
+                status=RunStatus.PENDING,
+                trigger_source=kwargs["trigger_source"],
+                parameters=kwargs["parameters"],
+                trade_date=kwargs["trade_date"],
+                resumed_from_run_id=kwargs["resumed_from_run_id"],
+                stage="QUEUED",
+                progress_message="等待前序任务完成",
+            )
+
+    monkeypatch.setattr(routes, "RUN_QUEUE", FakeQueue())
+    test_app = FastAPI()
+    test_app.include_router(router)
+
+    def override_session():
+        yield session
+
+    test_app.dependency_overrides[get_session] = override_session
+    transport = httpx.ASGITransport(app=test_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(f"/api/v1/agent/runs/{source.id}/resume")
+
+    assert response.status_code == 202
+    assert response.json()["run_id"] == "run_resumed"
+    assert response.json()["resumed_from_run_id"] == source.id
+    assert captured["resumed_from_run_id"] == source.id
+    assert captured["parameters"]["trade_date"] == date.today().isoformat()
+    assert session.get(AgentRun, source.id).status == RunStatus.FAILED
+
+
+async def test_resume_rejects_missing_non_failed_and_non_eod_runs(session):
+    completed = AgentRun(kind=RunKind.EOD, status=RunStatus.COMPLETED, trade_date=date.today())
+    intraday = AgentRun(kind=RunKind.INTRADAY, status=RunStatus.FAILED, trade_date=date.today())
+    session.add_all([completed, intraday])
+    session.commit()
+    test_app = FastAPI()
+    test_app.include_router(router)
+
+    def override_session():
+        yield session
+
+    test_app.dependency_overrides[get_session] = override_session
+    transport = httpx.ASGITransport(app=test_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        missing = await client.post("/api/v1/agent/runs/run_missing/resume")
+        completed_response = await client.post(f"/api/v1/agent/runs/{completed.id}/resume")
+        intraday_response = await client.post(f"/api/v1/agent/runs/{intraday.id}/resume")
+
+    assert missing.status_code == 404
+    assert completed_response.status_code == 409
+    assert intraday_response.status_code == 409
+
+
+async def test_run_detail_reports_checkpoint_summary(session):
+    instrument = Instrument(
+        exchange="SSE",
+        symbol="600099",
+        name="checkpoint API",
+        asset_type="STOCK",
+        industry="测试",
+        investable=True,
+    )
+    run = AgentRun(kind=RunKind.EOD, status=RunStatus.FAILED, trade_date=date.today())
+    session.add_all([instrument, run])
+    session.flush()
+    session.add(
+        ResearchPhaseCheckpoint(
+            run_id=run.id,
+            instrument_id=instrument.id,
+            trade_date=date.today(),
+            checkpoint_key="THESIS",
+            input_hash="a" * 64,
+            output_hash="b" * 64,
+            output_json={"ok": True},
+            provider="injected",
+            model_version="function-model",
+            prompt_version="cognition-v2",
+            schema_version="research-contract-v2",
+            strategy_version="alpha-sage-cognition-v1",
+        )
+    )
+    session.commit()
+    test_app = FastAPI()
+    test_app.include_router(router)
+
+    def override_session():
+        yield session
+
+    test_app.dependency_overrides[get_session] = override_session
+    transport = httpx.ASGITransport(app=test_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(f"/api/v1/agent/runs/{run.id}")
+
+    assert response.status_code == 200
+    assert response.json()["checkpoint_summary"] == {"available": 1, "generated": 1, "reused": 0}

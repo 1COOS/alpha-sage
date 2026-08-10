@@ -42,6 +42,12 @@ export type AgentRun = {
   started_at: string;
   updated_at?: string | null;
   finished_at?: string | null;
+  resumed_from_run_id?: string | null;
+  checkpoint_summary?: {
+    available: number;
+    generated: number;
+    reused: number;
+  };
 };
 
 export type RunAccepted = {
@@ -50,6 +56,7 @@ export type RunAccepted = {
   status: AgentRun["status"];
   stage?: string | null;
   message?: string | null;
+  resumed_from_run_id?: string | null;
 };
 
 export type LocalActionFeedback = {

@@ -1,13 +1,16 @@
+import json
 from datetime import date
 from types import SimpleNamespace
 
 import pytest
+from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from app.domain.enums import RunKind, RunStatus
+from app.domain.schemas import ThesisOutput
 from app.models import Account, AgentRun, Instrument, ModelInvocation, ResearchDossier, SystemSetting
 from app.services.agent import CognitiveAgent
-from app.services.model import OpenAICompatibleModel
+from app.services.model import ModelContractViolation, OpenAICompatibleModel
 from app.services.model_test import run_model_connection_test
 from app.services.run_queue import RunProgressReporter
 from app.services.secrets import SecretStore
@@ -20,6 +23,33 @@ def _candidate() -> dict:
         "reasoning_model": "reasoning-test",
         "fast_model": "fast-test",
         "daily_request_budget": 100,
+    }
+
+
+class MinimalPayload(BaseModel):
+    ok: bool
+
+
+def _thesis_payload(short_days: int, swing_days: int) -> dict:
+    def view(horizon: str, days: int) -> dict:
+        return {
+            "horizon": horizon,
+            "action": "WATCH",
+            "target_weight": 0,
+            "expected_return_low": -0.1,
+            "expected_return_high": 0.1,
+            "probability_up": 0.5,
+            "confidence": 0.5,
+            "holding_days": days,
+            "rationale": "证据不足时保持现金并等待新的可验证信息",
+            "risks": ["证据不足"],
+        }
+
+    return {
+        "summary": "研究结论",
+        "catalysts": ["新证据"],
+        "supporting_claims": ["当前保持谨慎"],
+        "horizon_views": [view("SHORT", short_days), view("SWING", swing_days), view("LONG", 90)],
     }
 
 
@@ -55,6 +85,170 @@ def test_failed_model_request_is_append_only_audited_without_api_key(session):
     assert invocation.request_json["endpoint"] == "/v1/responses"
     assert invocation.request_json["client_user_agent"] == "alpha-sage/0.1"
     assert invocation.response_json["request_id"] == "req-new-api-blocked"
+
+
+def test_structured_model_retries_null_responses_output_and_audits_invalid_response(session):
+    model = OpenAICompatibleModel(
+        session,
+        candidate=_candidate(),
+        api_key_override="secret-test-key",
+        timeout_seconds=1,
+        max_retries=0,
+    )
+    call_count = 0
+
+    class FakeResponses:
+        @staticmethod
+        def create(**_kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return SimpleNamespace(
+                    model_dump=lambda mode: {
+                        "id": "resp-null-output",
+                        "status": "completed",
+                        "error": None,
+                        "incomplete_details": None,
+                        "output": None,
+                    },
+                    _request_id="req-null-output",
+                )
+            return SimpleNamespace(
+                model_dump=lambda mode: {
+                    "id": "resp-retry-success",
+                    "status": "completed",
+                    "error": None,
+                    "incomplete_details": None,
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": '{"ok": true}'}],
+                        }
+                    ],
+                },
+                _request_id="req-retry-success",
+            )
+
+    model.client = SimpleNamespace(responses=FakeResponses())
+
+    result = model.complete_json(
+        purpose="research-synthesis",
+        system="system",
+        user="user",
+        schema=MinimalPayload,
+    )
+    session.commit()
+
+    assert result.ok is True
+    assert call_count == 2
+    invocations = list(session.scalars(select(ModelInvocation).order_by(ModelInvocation.created_at)))
+    assert [item.purpose for item in invocations] == [
+        "research-synthesis:attempt-1",
+        "research-synthesis:attempt-2",
+    ]
+    assert [item.status for item in invocations] == ["FAILED", "COMPLETED"]
+    assert invocations[0].error_type == "invalid_response"
+    assert invocations[0].http_status == 200
+    assert invocations[0].response_json["request_id"] == "req-null-output"
+    assert invocations[0].response_json["provider_response"] == {
+        "response_id": "resp-null-output",
+        "status": "completed",
+        "output_type": "null",
+        "output_item_count": None,
+        "output_item_types": [],
+        "has_incomplete_details": False,
+    }
+
+
+def test_contract_retry_includes_previous_output_and_precise_validation_errors(session):
+    model = OpenAICompatibleModel(
+        session,
+        candidate=_candidate(),
+        api_key_override="secret-test-key",
+        timeout_seconds=1,
+        max_retries=0,
+    )
+    inputs: list[str] = []
+
+    class FakeResponses:
+        @staticmethod
+        def create(**kwargs):
+            assert set(kwargs) == {"model", "instructions", "input"}
+            inputs.append(kwargs["input"])
+            payload = _thesis_payload(10, 60) if len(inputs) == 1 else _thesis_payload(3, 15)
+            return SimpleNamespace(
+                model_dump=lambda mode: {
+                    "id": f"resp-{len(inputs)}",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": json.dumps(payload, ensure_ascii=False)}],
+                        }
+                    ],
+                },
+                _request_id=f"req-{len(inputs)}",
+            )
+
+    model.client = SimpleNamespace(responses=FakeResponses())
+    result = model.complete_json(
+        purpose="research-thesis",
+        system="system",
+        user="user",
+        schema=ThesisOutput,
+    )
+
+    assert result.horizon_views[0].holding_days == 3
+    assert len(inputs) == 2
+    assert '"previous_output"' in inputs[1]
+    assert "horizon_views.0.SHORT.holding_days" in inputs[1]
+    assert "less than or equal to 5" in inputs[1]
+    assert '\\"holding_days\\": 10' in inputs[1]
+
+
+def test_two_contract_failures_raise_stable_invalid_response(session):
+    model = OpenAICompatibleModel(
+        session,
+        candidate=_candidate(),
+        api_key_override="secret-test-key",
+        timeout_seconds=1,
+        max_retries=0,
+    )
+    payload = _thesis_payload(10, 60)
+
+    class FakeResponses:
+        @staticmethod
+        def create(**_kwargs):
+            return SimpleNamespace(
+                model_dump=lambda mode: {
+                    "id": "resp-invalid-contract",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": json.dumps(payload, ensure_ascii=False)}],
+                        }
+                    ],
+                },
+                _request_id="req-invalid-contract",
+            )
+
+    model.client = SimpleNamespace(responses=FakeResponses())
+
+    with pytest.raises(ModelContractViolation) as raised:
+        model.complete_json(
+            purpose="research-thesis",
+            system="system",
+            user="user",
+            schema=ThesisOutput,
+        )
+
+    error_type, message, http_status, request_id = model.classify_error(raised.value)
+    assert error_type == "invalid_response"
+    assert http_status == 200
+    assert request_id == "req-invalid-contract"
+    assert "ThesisOutput" in message
+    assert "errors.pydantic.dev" not in message
 
 
 def test_eod_provider_block_is_visible_with_stage_model_latency_and_no_dossier(session, monkeypatch):
@@ -114,8 +308,21 @@ def test_model_connection_test_uses_temporary_key_without_persisting_settings(se
         def create(**kwargs):
             assert set(kwargs) == {"model", "instructions", "input"}
             return SimpleNamespace(
-                output_text='{"ok": true, "service": "alpha-sage"}',
-                model_dump=lambda mode: {"model": kwargs["model"], "ok": True},
+                model_dump=lambda mode: {
+                    "model": kwargs["model"],
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": '{"ok": true, "service": "alpha-sage"}',
+                                }
+                            ],
+                        }
+                    ],
+                },
                 _request_id=f"req-{kwargs['model']}",
             )
 
@@ -164,8 +371,21 @@ def test_model_connection_test_falls_back_to_stored_key_and_reports_partial_fail
             if kwargs["model"] == "fast-test":
                 raise BlockedError("Your request was blocked.")
             return SimpleNamespace(
-                output_text='{"ok": true, "service": "alpha-sage"}',
-                model_dump=lambda mode: {"model": kwargs["model"], "ok": True},
+                model_dump=lambda mode: {
+                    "model": kwargs["model"],
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": '{"ok": true, "service": "alpha-sage"}',
+                                }
+                            ],
+                        }
+                    ],
+                },
                 _request_id="req-reasoning-completed",
             )
 

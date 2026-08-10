@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -28,39 +28,54 @@ class EvidenceInput(BaseModel):
         return to_utc(value)
 
 
-class HorizonView(BaseModel):
-    horizon: Horizon
+class HorizonViewBase(BaseModel):
     action: DecisionAction
     target_weight: Decimal = Field(ge=0, le=0.10)
     expected_return_low: Decimal
     expected_return_high: Decimal
     probability_up: Decimal = Field(ge=0, le=1)
     confidence: Decimal = Field(ge=0, le=1)
-    holding_days: int = Field(ge=1, le=250)
     rationale: str = Field(min_length=10)
     risks: list[str] = Field(default_factory=list)
 
-    @field_validator("holding_days")
-    @classmethod
-    def validate_horizon_days(cls, value: int, info):
-        horizon = info.data.get("horizon")
-        bounds = {
-            Horizon.SHORT: (1, 5),
-            Horizon.SWING: (6, 30),
-            Horizon.LONG: (31, 250),
-        }
-        if horizon in bounds:
-            lower, upper = bounds[horizon]
-            if not lower <= value <= upper:
-                raise ValueError(f"{horizon} holding_days must be {lower}-{upper}")
-        return value
+
+class ShortHorizonView(HorizonViewBase):
+    horizon: Literal[Horizon.SHORT]
+    holding_days: int = Field(ge=1, le=5)
+
+
+class SwingHorizonView(HorizonViewBase):
+    horizon: Literal[Horizon.SWING]
+    holding_days: int = Field(ge=6, le=30)
+
+
+class LongHorizonView(HorizonViewBase):
+    horizon: Literal[Horizon.LONG]
+    holding_days: int = Field(ge=31, le=250)
+
+
+type HorizonView = Annotated[
+    ShortHorizonView | SwingHorizonView | LongHorizonView,
+    Field(discriminator="horizon"),
+]
+
+
+def _validate_complete_horizons(value: list[HorizonView]) -> list[HorizonView]:
+    actual = [item.horizon for item in value]
+    expected = {Horizon.SHORT, Horizon.SWING, Horizon.LONG}
+    if len(actual) != 3 or set(actual) != expected:
+        labels = ", ".join(str(item) for item in actual) or "none"
+        raise ValueError(f"horizon_views must contain exactly one SHORT, SWING, and LONG; got {labels}")
+    return value
 
 
 class ThesisOutput(BaseModel):
     summary: str
     catalysts: list[str]
     supporting_claims: list[str]
-    horizon_views: list[HorizonView]
+    horizon_views: list[HorizonView] = Field(min_length=3, max_length=3)
+
+    _complete_horizons = field_validator("horizon_views")(_validate_complete_horizons)
 
 
 class OppositionOutput(BaseModel):
@@ -74,7 +89,9 @@ class SynthesisOutput(BaseModel):
     verdict: Literal["INVEST", "WATCH", "REJECT"]
     summary: str
     material_new_evidence_required_for_long_reversal: list[str]
-    horizon_views: list[HorizonView]
+    horizon_views: list[HorizonView] = Field(min_length=3, max_length=3)
+
+    _complete_horizons = field_validator("horizon_views")(_validate_complete_horizons)
 
 
 class ResearchBundle(BaseModel):

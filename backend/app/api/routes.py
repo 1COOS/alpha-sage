@@ -7,7 +7,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select, text
+from sqlalchemy import case, func, select, text
 from sqlalchemy.orm import Session
 
 from app.db import get_session
@@ -32,6 +32,7 @@ from app.models import (
     OrderPlan,
     PaperFill,
     ResearchDossier,
+    ResearchPhaseCheckpoint,
     SourceHealth,
     StrategyVersion,
     SystemSetting,
@@ -63,7 +64,37 @@ def _accepted(run: AgentRun) -> dict:
         "status": run.status,
         "stage": run.stage,
         "message": run.progress_message,
+        "resumed_from_run_id": run.resumed_from_run_id,
     }
+
+
+def _checkpoint_summaries(session: Session, run_ids: list[str]) -> dict[str, dict[str, int]]:
+    if not run_ids:
+        return {}
+    rows = session.execute(
+        select(
+            ResearchPhaseCheckpoint.run_id,
+            func.count(ResearchPhaseCheckpoint.id),
+            func.sum(case((ResearchPhaseCheckpoint.source_checkpoint_id.is_(None), 1), else_=0)),
+            func.sum(case((ResearchPhaseCheckpoint.source_checkpoint_id.is_not(None), 1), else_=0)),
+        )
+        .where(ResearchPhaseCheckpoint.run_id.in_(run_ids))
+        .group_by(ResearchPhaseCheckpoint.run_id)
+    )
+    return {
+        run_id: {
+            "available": int(total or 0),
+            "generated": int(generated or 0),
+            "reused": int(reused or 0),
+        }
+        for run_id, total, generated, reused in rows
+    }
+
+
+def _run_payload(run: AgentRun, summary: dict[str, int] | None = None) -> dict:
+    payload = api_jsonable(run)
+    payload["checkpoint_summary"] = summary or {"available": 0, "generated": 0, "reused": 0}
+    return payload
 
 
 def _submit_or_conflict(**kwargs) -> AgentRun:
@@ -200,6 +231,31 @@ def run_eod(trade_date: date | None = None) -> dict:
     return _accepted(run)
 
 
+@router.post("/agent/runs/{run_id}/resume", status_code=202)
+def resume_eod(run_id: str, session: DbSession) -> dict:
+    source = session.get(AgentRun, run_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if source.kind != RunKind.EOD or source.status != "FAILED":
+        raise HTTPException(status_code=409, detail="只有 FAILED 的盘后研究任务可以续跑")
+    if source.trade_date is None:
+        raise HTTPException(status_code=409, detail="原任务缺少交易日，不能续跑")
+    resolved = source.trade_date
+
+    def job(job_session: Session, run: AgentRun, reporter: RunProgressReporter) -> AgentRun:
+        return CognitiveAgent(job_session).run_eod(resolved, run=run, reporter=reporter)
+
+    resumed = _submit_or_conflict(
+        kind=RunKind.EOD,
+        trigger_source="MANUAL",
+        parameters={"trade_date": resolved.isoformat(), "resumed_from_run_id": source.id},
+        trade_date=resolved,
+        resumed_from_run_id=source.id,
+        job=job,
+    )
+    return _accepted(resumed)
+
+
 @router.post("/agent/intraday", status_code=202)
 def run_intraday(trade_date: date | None = None) -> dict:
     resolved = trade_date or beijing_today()
@@ -251,8 +307,9 @@ def runs(
         query = query.where(AgentRun.status == status)
     if kind:
         query = query.where(AgentRun.kind == kind)
-    rows = session.scalars(query.order_by(AgentRun.started_at.desc()).limit(limit))
-    return api_jsonable(list(rows))
+    rows = list(session.scalars(query.order_by(AgentRun.started_at.desc()).limit(limit)))
+    summaries = _checkpoint_summaries(session, [row.id for row in rows])
+    return [_run_payload(row, summaries.get(row.id)) for row in rows]
 
 
 @router.get("/agent/runs/{run_id}")
@@ -260,7 +317,8 @@ def run_detail(run_id: str, session: DbSession) -> dict:
     run = session.get(AgentRun, run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="任务不存在")
-    return api_jsonable(run)
+    summaries = _checkpoint_summaries(session, [run.id])
+    return _run_payload(run, summaries.get(run.id))
 
 
 @router.get("/research")

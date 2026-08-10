@@ -30,6 +30,10 @@ Alpha Sage 通过 New API 等 OpenAI 兼容代理调用模型时统一发送 `Us
 
 常见分类包括 `authentication`、`permission`、`provider_blocked`、`timeout`、`network`、`rate_limit`、`model_not_found`、`bad_request`、`invalid_response` 和 `provider_error`。New API 前置代理或 WAF 返回 HTTP 403 `Your request was blocked.` 时会分类为 `provider_blocked`，并明确说明这不等同于 API Key 无效。
 
+Responses 接口即使返回 HTTP 200，也可能由兼容代理产生 `output=null`、消息内容缺失等不完整响应。Alpha Sage 不会把这类响应当成空结论继续执行，而会记录为 `invalid_response`；结构化研究会在追加保存失败调用后自动重试一次，第二次仍无有效输出则阻断当前任务。
+
+为保持 New API 代理兼容，运行时仍只发送 `model`、`instructions` 和 `input`，不启用 `text.format`。研究契约使用可辨识的 SHORT、SWING、LONG 三种 Schema，持有期分别限制为 1–5、6–30、31–250 天，且三个周期必须各出现一次。第一次输出校验失败后，第二次请求会附带原始输出和精简的字段级错误；系统不会替模型截断或修正数值。
+
 测试是真实模型调用，两次请求均计入每日调用预算并写入追加式 `model_invocations`。测试通过只证明当前连接、鉴权、模型名和最小结构化输出可用，不代表研究数据门禁或模拟账户启用条件已经通过。
 
 ## 安全边界

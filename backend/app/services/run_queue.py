@@ -119,6 +119,7 @@ class LocalRunQueue:
         parameters: dict[str, Any] | None,
         job: RunJob,
         trade_date: date | None = None,
+        resumed_from_run_id: str | None = None,
         reject_duplicate: bool = True,
         skip_if_busy: bool = False,
     ) -> AgentRun:
@@ -163,6 +164,7 @@ class LocalRunQueue:
                 stage="QUEUED",
                 progress_message="等待前序任务完成",
                 updated_at=utc_now(),
+                resumed_from_run_id=resumed_from_run_id,
             )
             session.add(run)
             session.commit()

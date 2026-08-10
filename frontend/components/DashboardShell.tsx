@@ -501,6 +501,13 @@ export function DashboardShell() {
                       run={item}
                       now={clock}
                       onDismiss={dismissTask}
+                      resumeDisabled={activeRuns.some((run) => run.kind === "EOD")}
+                      onResume={(source) => {
+                        const hasCheckpoint = (source.checkpoint_summary?.available ?? 0) > 0;
+                        void action(hasCheckpoint ? "继续盘后研究" : "重新运行盘后研究", () =>
+                          api(`/agent/runs/${source.id}/resume`, { method: "POST" }),
+                        );
+                      }}
                     />
                   ) : (
                     <LocalTaskCard
@@ -552,18 +559,23 @@ function RunTaskCard({
   run,
   now,
   onDismiss,
+  onResume,
+  resumeDisabled,
 }: {
   run: AgentRun;
   now: number;
   onDismiss: (id: string) => void;
+  onResume: (run: AgentRun) => void;
+  resumeDisabled: boolean;
 }) {
   const active = ACTIVE_STATUSES.has(run.status);
   const progress =
     run.progress_total && run.progress_current != null
       ? Math.min(100, (run.progress_current / run.progress_total) * 100)
       : null;
-  const sourceLabel =
-    run.trigger_source === "SCHEDULER"
+  const sourceLabel = run.resumed_from_run_id
+    ? "手动续跑"
+    : run.trigger_source === "SCHEDULER"
       ? "自动调度"
       : run.trigger_source === "MANUAL"
         ? "手动触发"
@@ -579,7 +591,25 @@ function RunTaskCard({
           <span className={`pill ${run.status.toLowerCase()}`}>{run.status}</span>
           <strong>{RUN_LABELS[run.kind] ?? run.kind}</strong>
         </div>
-        {!active && <button className="mini-button" onClick={() => onDismiss(run.id)}>关闭</button>}
+        {!active && (
+          <div className="task-card-actions">
+            {run.kind === "EOD" && run.status === "FAILED" && (
+              <button
+                className="mini-button"
+                disabled={resumeDisabled}
+                onClick={() => onResume(run)}
+                title={
+                  (run.checkpoint_summary?.available ?? 0) > 0
+                    ? "复用输入和契约仍一致的研究阶段"
+                    : "没有可复用 checkpoint，将完整重新运行"
+                }
+              >
+                {(run.checkpoint_summary?.available ?? 0) > 0 ? "继续运行" : "重新运行"}
+              </button>
+            )}
+            <button className="mini-button" onClick={() => onDismiss(run.id)}>关闭</button>
+          </div>
+        )}
       </div>
       <p>{message}</p>
       {progress != null && (
@@ -591,6 +621,12 @@ function RunTaskCard({
         {run.progress_total ? ` · ${run.progress_current ?? 0}/${run.progress_total}` : ""}
         {` · ${formatElapsed(run.started_at, run.finished_at, now)}`}
       </small>
+      {run.resumed_from_run_id && <small>来源任务：{run.resumed_from_run_id}</small>}
+      {run.checkpoint_summary && run.checkpoint_summary.available > 0 && (
+        <small>
+          checkpoint {run.checkpoint_summary.available} · 新生成 {run.checkpoint_summary.generated} · 复用 {run.checkpoint_summary.reused}
+        </small>
+      )}
       {Object.keys(run.result ?? {}).length > 0 && (
         <details><summary>查看结果</summary><pre>{JSON.stringify(run.result, null, 2)}</pre></details>
       )}

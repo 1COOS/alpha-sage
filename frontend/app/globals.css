@@ -188,6 +188,7 @@ td small { color: var(--muted); margin-top: 3px; }
 .task-card.running, .task-card.pending { border-left: 3px solid var(--acid); }
 .task-card-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
 .task-card-head > div { display: flex; align-items: center; gap: 8px; }
+.task-card-actions { flex-wrap: wrap; justify-content: flex-end; }
 .task-card p { margin: 0; color: var(--text); line-height: 1.5; overflow-wrap: anywhere; }
 .task-card small { color: var(--muted); font-family: "JetBrains Mono Variable", monospace; }
 .task-card details { border-top: 1px solid var(--line); padding-top: 9px; }
@@ -197,6 +198,7 @@ td small { color: var(--muted); margin-top: 3px; }
 .task-progress i { display: block; height: 100%; background: var(--acid); transition: width .2s ease; }
 .mini-button { border: 0; background: transparent; color: var(--muted); padding: 4px 6px; }
 .mini-button:hover { color: var(--text); }
+.mini-button:disabled { cursor: not-allowed; opacity: 0.45; }
 
 @media (max-width: 1100px) {
   .app-shell { grid-template-columns: 190px 1fr; }

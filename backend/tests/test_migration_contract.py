@@ -41,3 +41,14 @@ def test_run_feedback_migration_adds_progress_and_failed_model_audit_fields():
     for field in ("status", "latency_ms", "http_status", "error_type", "error_message"):
         assert field in text
     assert "ix_agent_runs_status_started" in text
+
+
+def test_research_checkpoint_migration_adds_resume_lineage_and_append_only_guards():
+    migration = Path(__file__).parents[1] / "alembic" / "versions" / "0006_research_checkpoints.py"
+    text = migration.read_text(encoding="utf-8")
+    assert "resumed_from_run_id" in text
+    assert "research_phase_checkpoints" in text
+    assert "source_checkpoint_id" in text
+    assert "model_invocation_id" in text
+    assert "research_phase_checkpoints_no_update" in text
+    assert "research_phase_checkpoints_no_delete" in text

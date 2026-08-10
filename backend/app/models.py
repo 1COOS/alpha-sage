@@ -177,6 +177,7 @@ class AgentRun(Base):
     blocker: Mapped[str | None] = mapped_column(Text)
     input_versions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    resumed_from_run_id: Mapped[str | None] = mapped_column(ForeignKey("agent_runs.id"))
 
 
 class EvidenceRef(Base):
@@ -443,6 +444,31 @@ class ModelInvocation(Base):
     http_status: Mapped[int | None] = mapped_column(Integer)
     error_type: Mapped[str | None] = mapped_column(String(80))
     error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+
+
+class ResearchPhaseCheckpoint(Base):
+    __tablename__ = "research_phase_checkpoints"
+    __table_args__ = (
+        UniqueConstraint("run_id", "instrument_id", "checkpoint_key", name="uq_research_checkpoint_run_phase"),
+        Index("ix_research_checkpoints_run", "run_id", "instrument_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: new_id("checkpoint"))
+    run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id"))
+    source_checkpoint_id: Mapped[str | None] = mapped_column(ForeignKey("research_phase_checkpoints.id"))
+    instrument_id: Mapped[str] = mapped_column(ForeignKey("instruments.id"))
+    trade_date: Mapped[date] = mapped_column(Date)
+    checkpoint_key: Mapped[str] = mapped_column(String(120))
+    input_hash: Mapped[str] = mapped_column(String(64))
+    output_hash: Mapped[str] = mapped_column(String(64))
+    output_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    model_invocation_id: Mapped[str | None] = mapped_column(ForeignKey("model_invocations.id"))
+    provider: Mapped[str] = mapped_column(String(160))
+    model_version: Mapped[str] = mapped_column(String(120))
+    prompt_version: Mapped[str] = mapped_column(String(80))
+    schema_version: Mapped[str] = mapped_column(String(80))
+    strategy_version: Mapped[str] = mapped_column(String(80))
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 

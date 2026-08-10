@@ -35,6 +35,42 @@ class ModelBudgetExceeded(ModelUnavailable):
     pass
 
 
+class ModelInvalidResponse(ModelUnavailable):
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str | None = None,
+        details: dict[str, Any] | None = None,
+    ):
+        super().__init__(message)
+        self.status_code = 200
+        self.request_id = request_id
+        self.details = details or {}
+
+
+class ModelContractViolation(ModelUnavailable):
+    def __init__(
+        self,
+        message: str,
+        *,
+        model: str,
+        purpose: str,
+        validation_errors: list[dict[str, Any]],
+        request_id: str | None,
+        endpoint: str,
+        client_user_agent: str,
+    ):
+        super().__init__(message)
+        self.status_code = 200
+        self.model = model
+        self.purpose = purpose
+        self.validation_errors = validation_errors
+        self.request_id = request_id
+        self.endpoint = endpoint
+        self.client_user_agent = client_user_agent
+
+
 @dataclass(frozen=True)
 class ResolvedModelSettings:
     base_url: str
@@ -167,21 +203,64 @@ class OpenAICompatibleModel:
         fast: bool = False,
     ) -> T:
         schema_json = json.dumps(schema.model_json_schema(), ensure_ascii=False)
-        prompt = f"{user}\n\n严格只返回满足以下 JSON Schema 的 JSON，不要 Markdown：\n{schema_json}"
+        prompt = self._structured_prompt(user=user, schema_json=schema_json)
         last_error: Exception | None = None
+        previous_output: str | None = None
+        validation_errors: list[dict[str, Any]] = []
         for attempt in range(2):
-            raw = self.complete_text(
-                purpose=f"{purpose}:attempt-{attempt + 1}",
-                system=system,
-                user=prompt if attempt == 0 else f"上次输出无法解析，请重新输出。\n{prompt}",
-                run_id=run_id,
-                fast=fast,
-            )
+            attempt_prompt = prompt
+            if attempt == 1:
+                attempt_prompt = self._structured_prompt(
+                    user=user,
+                    schema_json=schema_json,
+                    repair={
+                        "previous_output": previous_output,
+                        "validation_errors": validation_errors,
+                    },
+                )
+            try:
+                raw = self.complete_text(
+                    purpose=f"{purpose}:attempt-{attempt + 1}",
+                    system=system,
+                    user=attempt_prompt,
+                    run_id=run_id,
+                    fast=fast,
+                )
+            except ModelInvalidResponse as exc:
+                last_error = exc
+                previous_output = None
+                validation_errors = [
+                    {
+                        "location": "response.output",
+                        "type": "invalid_response",
+                        "message": str(exc),
+                    }
+                ]
+                if attempt == 1:
+                    raise
+                continue
             try:
                 payload = json.loads(self._extract_json(raw))
                 return schema.model_validate(payload)
             except (json.JSONDecodeError, ValidationError) as exc:
                 last_error = exc
+                previous_output = raw
+                validation_errors = self._compact_validation_errors(exc)
+                if attempt == 1:
+                    model = self.fast_model if fast else self.reasoning_model
+                    purpose_with_attempt = f"{purpose}:attempt-{attempt + 1}"
+                    message = self._contract_failure_message(schema.__name__, validation_errors)
+                    raise ModelContractViolation(
+                        message,
+                        model=model,
+                        purpose=purpose_with_attempt,
+                        validation_errors=validation_errors,
+                        request_id=self.last_call_metadata.get("request_id"),
+                        endpoint=str(self.last_call_metadata.get("endpoint") or MODEL_ENDPOINTS["responses"]),
+                        client_user_agent=str(
+                            self.last_call_metadata.get("client_user_agent") or MODEL_CLIENT_USER_AGENT
+                        ),
+                    ) from exc
         raise ModelUnavailable(f"模型连续两次返回不符合契约的结果：{last_error}")
 
     def complete_text(
@@ -237,8 +316,9 @@ class OpenAICompatibleModel:
                     instructions=system,
                     input=user,
                 )
-                text = response.output_text
                 response_json = response.model_dump(mode="json")
+                request_id = self._extract_request_id(response)
+                text = self._extract_responses_text(response_json, request_id=request_id)
             latency_ms = round((perf_counter() - started) * 1000)
             request_id = self._extract_request_id(response)
             if request_id:
@@ -249,7 +329,7 @@ class OpenAICompatibleModel:
                 "http_status": 200,
                 "request_id": request_id,
             }
-            self._record_invocation(
+            invocation = self._record_invocation(
                 run_id=run_id,
                 purpose=purpose,
                 model=model,
@@ -259,6 +339,7 @@ class OpenAICompatibleModel:
                 latency_ms=latency_ms,
                 http_status=200,
             )
+            self.last_call_metadata["invocation_id"] = invocation.id
             return text
         except Exception as exc:
             error_type, error_message, http_status, request_id = self.classify_error(exc)
@@ -271,6 +352,8 @@ class OpenAICompatibleModel:
                 "endpoint": endpoint,
                 "client_user_agent": MODEL_CLIENT_USER_AGENT,
             }
+            if isinstance(exc, ModelInvalidResponse):
+                error_json["provider_response"] = exc.details
             self.last_call_metadata |= {
                 "status": "FAILED",
                 "latency_ms": latency_ms,
@@ -291,6 +374,7 @@ class OpenAICompatibleModel:
                 error_message=error_message,
             )
             setattr(exc, MODEL_FAILURE_AUDIT_ATTR, self._invocation_snapshot(invocation))
+            self.last_call_metadata["invocation_id"] = invocation.id
             raise
 
     def _record_invocation(
@@ -354,6 +438,8 @@ class OpenAICompatibleModel:
             error_type = "rate_limit"
         elif "notfound" in class_name or http_status == 404 or "model not found" in lowered:
             error_type = "model_not_found"
+        elif isinstance(exc, (ModelInvalidResponse, ModelContractViolation)):
+            error_type = "invalid_response"
         elif http_status == 400:
             error_type = "bad_request"
         else:
@@ -399,6 +485,136 @@ class OpenAICompatibleModel:
         for pattern, replacement in patterns:
             message = re.sub(pattern, replacement, message)
         return message[:500]
+
+    def _extract_responses_text(
+        self,
+        response_json: dict[str, Any],
+        *,
+        request_id: str | None,
+    ) -> str:
+        output = response_json.get("output")
+        texts: list[str] = []
+        if isinstance(output, list):
+            for item in output:
+                if not isinstance(item, dict) or item.get("type") != "message":
+                    continue
+                content = item.get("content")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "output_text":
+                        text = block.get("text")
+                        if isinstance(text, str):
+                            texts.append(text)
+        if texts:
+            return "".join(texts)
+
+        details = self._response_diagnostics(response_json)
+        status = details.get("status") or "unknown"
+        output_type = details["output_type"]
+        raise ModelInvalidResponse(
+            f"上游返回 HTTP 200，但 Responses 响应缺少可用输出文本（status={status}, output={output_type}）",
+            request_id=request_id,
+            details=details,
+        )
+
+    def _response_diagnostics(self, response_json: dict[str, Any]) -> dict[str, Any]:
+        output = response_json.get("output")
+        if output is None:
+            output_type = "null"
+        elif isinstance(output, list):
+            output_type = "array"
+        else:
+            output_type = type(output).__name__
+        details: dict[str, Any] = {
+            "response_id": response_json.get("id"),
+            "status": response_json.get("status"),
+            "output_type": output_type,
+            "output_item_count": len(output) if isinstance(output, list) else None,
+            "output_item_types": [
+                item.get("type") if isinstance(item, dict) else type(item).__name__ for item in output[:10]
+            ]
+            if isinstance(output, list)
+            else [],
+            "has_incomplete_details": response_json.get("incomplete_details") is not None,
+        }
+        provider_error = response_json.get("error")
+        if isinstance(provider_error, dict):
+            details["error"] = {
+                key: self._sanitize_error_message(str(provider_error[key]), secrets=(self._api_key_for_redaction,))
+                for key in ("type", "code", "message")
+                if provider_error.get(key) is not None
+            }
+        elif provider_error is not None:
+            details["error"] = self._sanitize_error_message(
+                str(provider_error),
+                secrets=(self._api_key_for_redaction,),
+            )
+        return details
+
+    @staticmethod
+    def _structured_prompt(
+        *,
+        user: str,
+        schema_json: str,
+        repair: dict[str, Any] | None = None,
+    ) -> str:
+        sections = [user]
+        if repair is not None:
+            sections.extend(
+                [
+                    "上次输出没有通过契约校验。必须根据以下错误逐项修正；不得省略字段、改变业务含义或解释错误：",
+                    json.dumps(repair, ensure_ascii=False, default=str),
+                ]
+            )
+        sections.extend(
+            [
+                "严格只返回满足以下 JSON Schema 的 JSON，不要 Markdown：",
+                schema_json,
+            ]
+        )
+        return "\n\n".join(sections)
+
+    @staticmethod
+    def _compact_validation_errors(exc: json.JSONDecodeError | ValidationError) -> list[dict[str, Any]]:
+        if isinstance(exc, json.JSONDecodeError):
+            return [
+                {
+                    "location": f"line {exc.lineno}, column {exc.colno}",
+                    "type": "json_invalid",
+                    "message": exc.msg,
+                }
+            ]
+        compact: list[dict[str, Any]] = []
+        for item in exc.errors(include_url=False):
+            detail: dict[str, Any] = {
+                "location": ".".join(str(part) for part in item.get("loc", ())) or "root",
+                "type": item.get("type", "validation_error"),
+                "message": item.get("msg", "invalid value"),
+            }
+            value = item.get("input")
+            if value is None or isinstance(value, str | int | float | bool):
+                detail["input"] = value
+            context = item.get("ctx")
+            if isinstance(context, dict):
+                safe_context = {
+                    key: value
+                    for key, value in context.items()
+                    if value is None or isinstance(value, str | int | float | bool)
+                }
+                if safe_context:
+                    detail["context"] = safe_context
+            compact.append(detail)
+        return compact
+
+    @staticmethod
+    def _contract_failure_message(schema_name: str, errors: list[dict[str, Any]]) -> str:
+        summaries = []
+        for item in errors[:4]:
+            value = f"，输入={item['input']}" if "input" in item else ""
+            summaries.append(f"{item['location']}：{item['message']}{value}")
+        detail = "；".join(summaries) or "未知契约错误"
+        return f"模型连续两次返回不符合 {schema_name} 契约的结果：{detail}"
 
     @staticmethod
     def _invocation_snapshot(invocation: ModelInvocation) -> dict[str, Any]:
@@ -454,13 +670,33 @@ def format_run_failure(
     stage: str | None,
     exc: Exception,
 ) -> tuple[str, dict[str, Any]]:
-    invocation = session.scalar(
-        select(ModelInvocation)
-        .where(ModelInvocation.run_id == run_id, ModelInvocation.status == "FAILED")
-        .order_by(ModelInvocation.created_at.desc())
-        .limit(1)
-    )
     failed_stage = stage or "RUNNING"
+    if isinstance(exc, ModelContractViolation):
+        detail = {
+            "stage": failed_stage,
+            "model": exc.model,
+            "purpose": exc.purpose,
+            "latency_ms": None,
+            "http_status": 200,
+            "error_type": "invalid_response",
+            "message": str(exc),
+            "endpoint": exc.endpoint,
+            "client_user_agent": exc.client_user_agent,
+            "request_id": exc.request_id,
+            "validation_errors": exc.validation_errors,
+        }
+        return (
+            f"{failed_stage} 阶段调用模型 {exc.model} 失败（invalid_response）：{exc}",
+            {"failure": detail},
+        )
+    invocation = None
+    if has_model_failure(exc):
+        invocation = session.scalar(
+            select(ModelInvocation)
+            .where(ModelInvocation.run_id == run_id, ModelInvocation.status == "FAILED")
+            .order_by(ModelInvocation.created_at.desc())
+            .limit(1)
+        )
     if invocation is not None:
         detail = {
             "stage": failed_stage,
