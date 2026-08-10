@@ -10,6 +10,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.models import MarketRuleVersion
+from app.temporal import require_aware
 
 
 @dataclass(frozen=True)
@@ -66,9 +67,7 @@ class CNMarketAdapter:
         self.session = session
 
     def local_trade_date(self, value: datetime) -> date:
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=self.timezone)
-        return value.astimezone(self.timezone).date()
+        return require_aware(value).astimezone(self.timezone).date()
 
     @staticmethod
     def lot_size(_asset_type: str) -> int:

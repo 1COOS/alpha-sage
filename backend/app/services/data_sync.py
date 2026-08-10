@@ -3,7 +3,7 @@ from __future__ import annotations
 import statistics
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -27,6 +27,7 @@ from app.services.providers import (
     InstrumentSeed,
     TencentHistoryProvider,
 )
+from app.temporal import beijing_today
 
 
 class DataQualityBlocked(RuntimeError):
@@ -81,7 +82,7 @@ class HistorySyncService:
             self.session.commit()
         try:
             await self.baostock.open()
-            end = datetime.now().astimezone().date()
+            end = beijing_today()
             start = end - timedelta(days=years * 366)
             self._emit_progress(
                 HistorySyncProgress(

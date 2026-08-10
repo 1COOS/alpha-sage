@@ -9,7 +9,6 @@ from sqlalchemy import (
     JSON,
     Boolean,
     Date,
-    DateTime,
     ForeignKey,
     Index,
     Integer,
@@ -21,6 +20,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
+from app.temporal import UTCDateTime, to_utc
 
 
 def new_id(prefix: str) -> str:
@@ -32,7 +32,7 @@ def utc_now() -> datetime:
 
 
 def ensure_utc(value: datetime) -> datetime:
-    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    return to_utc(value)
 
 
 class SystemSetting(Base):
@@ -40,7 +40,7 @@ class SystemSetting(Base):
 
     key: Mapped[str] = mapped_column(String(100), primary_key=True)
     value: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class SourceHealth(Base):
@@ -49,7 +49,7 @@ class SourceHealth(Base):
     source_id: Mapped[str] = mapped_column(String(80), primary_key=True)
     role: Mapped[str] = mapped_column(String(80))
     status: Mapped[str] = mapped_column(String(40))
-    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_checked_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     detail: Mapped[str | None] = mapped_column(Text)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
@@ -66,8 +66,8 @@ class Account(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     paused_reason: Mapped[str | None] = mapped_column(Text)
     high_watermark: Mapped[Decimal] = mapped_column(Numeric(20, 4))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class MarketRuleVersion(Base):
@@ -81,7 +81,7 @@ class MarketRuleVersion(Base):
     content: Mapped[dict[str, Any]] = mapped_column(JSON)
     content_hash: Mapped[str] = mapped_column(String(64))
     source_uri: Mapped[str] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class Instrument(Base):
@@ -106,8 +106,8 @@ class Instrument(Base):
     investable: Mapped[bool] = mapped_column(Boolean, default=False)
     exclusion_reason: Mapped[str | None] = mapped_column(Text)
     source_version: Mapped[str | None] = mapped_column(String(80))
-    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    available_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class MarketCalendarDay(Base):
@@ -117,7 +117,7 @@ class MarketCalendarDay(Base):
     trade_date: Mapped[date] = mapped_column(Date, primary_key=True)
     is_open: Mapped[bool] = mapped_column(Boolean)
     source: Mapped[str] = mapped_column(String(80))
-    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    available_at: Mapped[datetime] = mapped_column(UTCDateTime())
 
 
 class DataArtifact(Base):
@@ -132,9 +132,26 @@ class DataArtifact(Base):
     rows: Mapped[int] = mapped_column(Integer)
     min_date: Mapped[date | None] = mapped_column(Date)
     max_date: Mapped[date | None] = mapped_column(Date)
-    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    sealed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    available_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    sealed_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class TimeCorrection(Base):
+    __tablename__ = "time_corrections"
+    __table_args__ = (
+        UniqueConstraint("entity_type", "entity_id", "field_name", name="uq_time_correction_target"),
+        Index("ix_time_corrections_target", "entity_type", "entity_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: new_id("tc"))
+    entity_type: Mapped[str] = mapped_column(String(80))
+    entity_id: Mapped[str] = mapped_column(String(64))
+    field_name: Mapped[str] = mapped_column(String(80))
+    original_value: Mapped[str] = mapped_column(Text)
+    canonical_utc: Mapped[datetime] = mapped_column(UTCDateTime())
+    reason: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class AgentRun(Base):
@@ -150,9 +167,9 @@ class AgentRun(Base):
     trigger_source: Mapped[str] = mapped_column(String(32), default="SYSTEM")
     parameters: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     trade_date: Mapped[date | None] = mapped_column(Date)
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    started_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
     stage: Mapped[str | None] = mapped_column(String(80))
     progress_current: Mapped[int | None] = mapped_column(Integer)
     progress_total: Mapped[int | None] = mapped_column(Integer)
@@ -172,8 +189,8 @@ class EvidenceRef(Base):
     source_uri: Mapped[str] = mapped_column(Text)
     title: Mapped[str] = mapped_column(Text)
     excerpt: Mapped[str] = mapped_column(Text)
-    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    published_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    fetched_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
     credibility: Mapped[str] = mapped_column(String(32))
     content_hash: Mapped[str] = mapped_column(String(64))
     raw_artifact_id: Mapped[str | None] = mapped_column(ForeignKey("data_artifacts.id"))
@@ -196,7 +213,7 @@ class ResearchDossier(Base):
     model_version: Mapped[str] = mapped_column(String(120))
     prompt_version: Mapped[str] = mapped_column(String(80))
     data_versions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class DecisionRevision(Base):
@@ -226,7 +243,7 @@ class DecisionRevision(Base):
     evidence_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     strategy_version_id: Mapped[str] = mapped_column(ForeignKey("strategy_versions.id"))
     risk_version: Mapped[str] = mapped_column(String(80))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class OrderPlan(Base):
@@ -246,9 +263,9 @@ class OrderPlan(Base):
     limit_price: Mapped[Decimal | None] = mapped_column(Numeric(16, 4))
     status: Mapped[str] = mapped_column(String(32))
     blocked_reason: Mapped[str | None] = mapped_column(Text)
-    eligible_after: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    eligible_after: Mapped[datetime] = mapped_column(UTCDateTime())
+    expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class PaperFill(Base):
@@ -270,8 +287,8 @@ class PaperFill(Base):
     market_rule_version_id: Mapped[str | None] = mapped_column(ForeignKey("market_rule_versions.id"))
     bar_artifact_id: Mapped[str] = mapped_column(ForeignKey("data_artifacts.id"))
     local_trade_date: Mapped[date] = mapped_column(Date)
-    filled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    filled_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class PositionLot(Base):
@@ -287,7 +304,7 @@ class PositionLot(Base):
     quantity: Mapped[int] = mapped_column(Integer)
     remaining_quantity: Mapped[int] = mapped_column(Integer)
     cost_price: Mapped[Decimal] = mapped_column(Numeric(16, 4))
-    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
 
 
 class CashLedgerEntry(Base):
@@ -301,8 +318,8 @@ class CashLedgerEntry(Base):
     currency: Mapped[str] = mapped_column(String(3), default="CNY")
     reference_type: Mapped[str] = mapped_column(String(40))
     reference_id: Mapped[str] = mapped_column(String(64))
-    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    occurred_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class PortfolioSnapshot(Base):
@@ -310,7 +327,7 @@ class PortfolioSnapshot(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: new_id("snap"))
     account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"))
-    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    as_of: Mapped[datetime] = mapped_column(UTCDateTime())
     cash: Mapped[Decimal] = mapped_column(Numeric(20, 4))
     market_value: Mapped[Decimal] = mapped_column(Numeric(20, 4))
     equity: Mapped[Decimal] = mapped_column(Numeric(20, 4))
@@ -342,7 +359,7 @@ class Experience(Base):
     max_adverse_excursion: Mapped[Decimal] = mapped_column(Numeric(12, 6))
     attribution: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class LessonCandidate(Base):
@@ -356,7 +373,7 @@ class LessonCandidate(Base):
     contradicting_experience_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     confidence: Mapped[Decimal] = mapped_column(Numeric(8, 6))
     status: Mapped[str] = mapped_column(String(32), default="PROPOSED")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class StrategyVersion(Base):
@@ -370,8 +387,8 @@ class StrategyVersion(Base):
     prompt_overrides: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     evidence_weights: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     content_hash: Mapped[str] = mapped_column(String(64))
-    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    activated_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class ChallengerReport(Base):
@@ -391,9 +408,9 @@ class ChallengerReport(Base):
     champion_calibration_score: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=0)
     hard_risk_violations: Mapped[int] = mapped_column(Integer, default=0)
     metrics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    approved_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     approved_reason: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class UserFeedback(Base):
@@ -406,7 +423,7 @@ class UserFeedback(Base):
     sentiment: Mapped[str] = mapped_column(String(20), default="NEUTRAL")
     outcome_note: Mapped[str | None] = mapped_column(Text)
     used_for_challenger: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class ModelInvocation(Base):
@@ -426,7 +443,7 @@ class ModelInvocation(Base):
     http_status: Mapped[int | None] = mapped_column(Integer)
     error_type: Mapped[str | None] = mapped_column(String(80))
     error_message: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class IntradayTriggerState(Base):
@@ -437,7 +454,7 @@ class IntradayTriggerState(Base):
     trade_date: Mapped[date] = mapped_column(Date)
     instrument_id: Mapped[str] = mapped_column(ForeignKey("instruments.id"))
     call_count: Mapped[int] = mapped_column(Integer, default=0)
-    last_called_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_called_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     last_price: Mapped[Decimal | None] = mapped_column(Numeric(16, 4))
     last_reason: Mapped[str | None] = mapped_column(Text)
 
@@ -453,4 +470,4 @@ class AuditEvent(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     previous_hash: Mapped[str | None] = mapped_column(String(64))
     event_hash: Mapped[str] = mapped_column(String(64), unique=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)

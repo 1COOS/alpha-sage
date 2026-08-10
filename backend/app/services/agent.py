@@ -40,6 +40,7 @@ from app.services.model import OpenAICompatibleModel, StructuredModel, format_ru
 from app.services.preflight import PreflightService
 from app.services.risk import RiskEngine
 from app.services.run_queue import RunProgressReporter
+from app.temporal import SHANGHAI
 
 SYSTEM_PROMPT = """你是 Alpha Sage，一个证据优先、会承认不确定性的投资认知 Agent。
 你不是传统因子打分器。你的职责是形成可证伪论点、主动寻找反证、区分三个投资周期，
@@ -321,7 +322,7 @@ class CognitiveAgent:
                 select(EvidenceRef.instrument_id, func.count(EvidenceRef.id))
                 .where(
                     EvidenceRef.published_at
-                    >= datetime.combine(trade_date - timedelta(days=30), datetime.min.time()).astimezone()
+                    >= datetime.combine(trade_date - timedelta(days=30), datetime.min.time(), SHANGHAI)
                 )
                 .group_by(EvidenceRef.instrument_id)
             ).all()

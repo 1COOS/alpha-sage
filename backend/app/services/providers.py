@@ -9,13 +9,12 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import ClassVar, Protocol, TypeVar
-from zoneinfo import ZoneInfo
 
 import httpx
 
 from app.config import get_settings
+from app.temporal import SHANGHAI
 
-SHANGHAI = ZoneInfo("Asia/Shanghai")
 T = TypeVar("T")
 
 

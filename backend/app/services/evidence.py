@@ -12,6 +12,7 @@ from app.config import get_settings
 from app.domain.schemas import EvidenceInput
 from app.models import EvidenceRef, Instrument, SystemSetting, utc_now
 from app.services.artifacts import ArtifactStore
+from app.temporal import to_utc
 
 
 class EvidenceRejected(RuntimeError):
@@ -70,7 +71,7 @@ class TrustedEvidenceService:
             source_uri=str(response.url),
             title=title,
             excerpt=excerpt,
-            published_at=published_at or now,
+            published_at=to_utc(published_at) if published_at is not None else now,
             fetched_at=now,
             credibility="OFFICIAL" if self._official(host) else "HIGH",
             content_hash=hashlib.sha256(raw).hexdigest(),

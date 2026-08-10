@@ -2,6 +2,15 @@
 
 默认地址：`http://127.0.0.1:7777/api/v1`。
 
+## 时间契约
+
+数据库中的绝对时间统一保存为 UTC；HTTP API 中所有 `datetime` 统一返回带明确偏移的北京时间
+RFC 3339 字符串，例如 `2026-08-10T10:22:57.807280+08:00`。`trade_date`、
+`local_trade_date` 等纯日期字段不做时区换算。
+
+API 接收时间时允许 `Z`、`+08:00` 等任意明确偏移，并在入库前换算为 UTC；缺少时区偏移的
+时间返回 `422`，不会默认猜测为本地时间。
+
 | 分组 | 接口 |
 |---|---|
 | 健康与门禁 | `GET /health`、`GET /system/status`、`POST /system/preflight`、`POST /system/enable`、`POST /system/pause` |

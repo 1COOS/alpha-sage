@@ -15,6 +15,7 @@ from app.services.data_sync import HistorySyncProgress, HistorySyncService
 from app.services.evolution import EvolutionService, ExperienceService
 from app.services.intraday import IntradayService
 from app.services.preflight import PreflightService
+from app.temporal import beijing_today
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -64,7 +65,7 @@ def sync_history(years: int = 5, limit: int | None = None) -> None:
 @app.command("run-eod")
 def run_eod(trade_date: str | None = None) -> None:
     with SessionLocal() as session:
-        resolved = date.fromisoformat(trade_date) if trade_date else date.today()
+        resolved = date.fromisoformat(trade_date) if trade_date else beijing_today()
         run = CognitiveAgent(session).run_eod(resolved)
         typer.echo(f"{run.status}: {run.result or run.blocker}")
 

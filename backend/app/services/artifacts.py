@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.models import DataArtifact, utc_now
+from app.temporal import to_utc
 
 
 class ArtifactStore:
@@ -47,7 +48,7 @@ class ArtifactStore:
             rows=len(rows),
             min_date=min((item for item in dates if item), default=None),
             max_date=max((item for item in dates if item), default=None),
-            available_at=available_at,
+            available_at=to_utc(available_at),
             metadata_json=metadata or {},
         )
         self.session.add(artifact)
@@ -86,7 +87,9 @@ class ArtifactStore:
     def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
         normalized: dict[str, Any] = {}
         for key, value in row.items():
-            if isinstance(value, (datetime, date)):
+            if isinstance(value, datetime):
+                normalized[key] = to_utc(value).isoformat()
+            elif isinstance(value, date):
                 normalized[key] = value.isoformat()
             elif hasattr(value, "as_tuple"):
                 normalized[key] = str(value)

@@ -9,7 +9,7 @@ import duckdb
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import DataArtifact, Instrument, ensure_utc
+from app.models import DataArtifact, Instrument, TimeCorrection, ensure_utc
 
 
 class MarketRepository:
@@ -41,7 +41,26 @@ class MarketRepository:
     ) -> list[dict[str, Any]]:
         artifacts = self.confirmed_artifacts(instrument)
         if available_by is not None:
-            artifacts = [row for row in artifacts if ensure_utc(row.available_at) <= ensure_utc(available_by)]
+            artifact_ids = [row.id for row in artifacts]
+            corrections = (
+                {
+                    entity_id: canonical_utc
+                    for entity_id, canonical_utc in self.session.execute(
+                        select(TimeCorrection.entity_id, TimeCorrection.canonical_utc).where(
+                            TimeCorrection.entity_type == "DataArtifact",
+                            TimeCorrection.field_name == "available_at",
+                            TimeCorrection.entity_id.in_(artifact_ids),
+                        )
+                    )
+                }
+                if artifact_ids
+                else {}
+            )
+            artifacts = [
+                row
+                for row in artifacts
+                if ensure_utc(corrections.get(row.id, row.available_at)) <= ensure_utc(available_by)
+            ]
         paths = [row.path for row in artifacts if Path(row.path).exists()]
         if not paths:
             return []

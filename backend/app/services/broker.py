@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import date
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 
 from sqlalchemy import select
@@ -14,6 +14,8 @@ from app.models import (
     OrderPlan,
     PaperFill,
     PositionLot,
+    ensure_utc,
+    utc_now,
 )
 from app.services.audit import append_audit
 from app.services.market_adapter import CNMarketAdapter, MarketAdapter
@@ -110,11 +112,7 @@ class PaperBroker:
             market_rule_version_id=fees.rule_version_id,
             bar_artifact_id=artifact_id,
             local_trade_date=bar.trade_date,
-            filled_at=(
-                bar.observed_at.replace(tzinfo=self.market.timezone)
-                if bar.observed_at.tzinfo is None
-                else bar.observed_at
-            ).astimezone(UTC),
+            filled_at=ensure_utc(bar.observed_at),
         )
         self.session.add(fill)
         self.session.flush()
@@ -141,7 +139,7 @@ class PaperBroker:
                 balance_after=account.cash,
                 reference_type="PaperFill",
                 reference_id=fill.id,
-                occurred_at=bar.observed_at,
+                occurred_at=ensure_utc(bar.observed_at),
             )
         )
         append_audit(
@@ -187,7 +185,7 @@ class PaperBroker:
             lot.remaining_quantity -= consumed
             remaining -= consumed
             if lot.remaining_quantity == 0:
-                lot.closed_at = datetime.now().astimezone()
+                lot.closed_at = utc_now()
             if remaining == 0:
                 break
 

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
+import { compareTimestampsDesc, formatElapsed } from "@/lib/datetime";
 import {
   ChatView,
   EvolutionView,
@@ -88,16 +89,6 @@ function labelForRun(run: AgentRun): string | null {
     return run.parameters.limit ? "小规模数据验证" : "五年历史同步";
   }
   return RUN_LABELS[run.kind] ?? null;
-}
-
-function formatElapsed(startedAt: string, finishedAt: string | null | undefined, now: number): string {
-  const started = Date.parse(startedAt);
-  const ended = finishedAt ? Date.parse(finishedAt) : now;
-  if (!Number.isFinite(started) || !Number.isFinite(ended)) return "耗时未知";
-  const seconds = Math.max(0, Math.floor((ended - started) / 1000));
-  if (seconds < 60) return `${seconds} 秒`;
-  const minutes = Math.floor(seconds / 60);
-  return `${minutes} 分 ${seconds % 60} 秒`;
 }
 
 function safeParse<T>(raw: string | null, fallback: T): T {
@@ -321,7 +312,7 @@ export function DashboardShell() {
           started_at: run.started_at,
         }];
       }),
-    ].sort((left, right) => right.started_at.localeCompare(left.started_at));
+    ].sort((left, right) => compareTimestampsDesc(left.started_at, right.started_at));
     const result = new Map<string, ActionFeedbackSummary>();
     for (const item of candidates) {
       if (!result.has(item.label)) result.set(item.label, item);
@@ -498,8 +489,9 @@ export function DashboardShell() {
             <div className="task-list">
               {[...visibleLocal, ...visibleRuns]
                 .sort((left, right) =>
-                  String("started_at" in right ? right.started_at : "").localeCompare(
+                  compareTimestampsDesc(
                     String("started_at" in left ? left.started_at : ""),
+                    String("started_at" in right ? right.started_at : ""),
                   ),
                 )
                 .map((item) =>

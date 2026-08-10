@@ -40,6 +40,7 @@ from app.services.audit import append_audit, stable_hash
 from app.services.market_repository import MarketRepository
 from app.services.model import OpenAICompatibleModel, StructuredModel
 from app.services.run_queue import RunProgressReporter
+from app.temporal import beijing_today
 
 
 class ExperienceService:
@@ -48,7 +49,7 @@ class ExperienceService:
         self.market = MarketRepository(session)
 
     def attribute_due(self, as_of: date | None = None) -> list[Experience]:
-        as_of = as_of or date.today()
+        as_of = as_of or beijing_today()
         decisions = list(
             self.session.scalars(
                 select(DecisionRevision)
@@ -189,7 +190,7 @@ class EvolutionService:
         run: AgentRun | None = None,
         reporter: RunProgressReporter | None = None,
     ) -> AgentRun:
-        week_ending = week_ending or date.today()
+        week_ending = week_ending or beijing_today()
         if run is None:
             run = AgentRun(kind=RunKind.WEEKLY, status=RunStatus.RUNNING, trade_date=week_ending)
             self.session.add(run)
@@ -257,7 +258,7 @@ class EvolutionService:
         run: AgentRun | None = None,
         reporter: RunProgressReporter | None = None,
     ) -> AgentRun:
-        as_of = as_of or date.today()
+        as_of = as_of or beijing_today()
         if run is None:
             run = AgentRun(kind=RunKind.MONTHLY, status=RunStatus.RUNNING, trade_date=as_of)
             self.session.add(run)

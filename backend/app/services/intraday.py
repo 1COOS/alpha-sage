@@ -29,6 +29,7 @@ from app.services.market_adapter import CNMarketAdapter
 from app.services.model import format_run_failure, has_model_failure
 from app.services.providers import EastmoneyProvider, InstrumentSeed, TencentQuoteProvider
 from app.services.run_queue import RunProgressReporter
+from app.temporal import beijing_today
 
 
 class IntradayService:
@@ -61,7 +62,7 @@ class IntradayService:
         run: AgentRun | None = None,
         reporter: RunProgressReporter | None = None,
     ) -> AgentRun:
-        trade_date = trade_date or datetime.now().astimezone().date()
+        trade_date = trade_date or beijing_today()
         if run is None:
             run = AgentRun(kind=RunKind.INTRADAY, status=RunStatus.RUNNING, trade_date=trade_date)
             self.session.add(run)

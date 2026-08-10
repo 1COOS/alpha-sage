@@ -7,6 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.domain.enums import DecisionAction, Horizon
+from app.temporal import to_utc
 
 
 class ORMModel(BaseModel):
@@ -20,6 +21,11 @@ class EvidenceInput(BaseModel):
     excerpt: str
     published_at: datetime
     credibility: Literal["OFFICIAL", "HIGH", "MEDIUM", "LOW"]
+
+    @field_validator("published_at")
+    @classmethod
+    def validate_published_at_timezone(cls, value: datetime) -> datetime:
+        return to_utc(value)
 
 
 class HorizonView(BaseModel):

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date
-from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -16,8 +14,7 @@ from app.services.agent import CognitiveAgent
 from app.services.evolution import EvolutionService, ExperienceService
 from app.services.intraday import IntradayService
 from app.services.run_queue import RUN_QUEUE, ActiveRunConflict, RunProgressReporter
-
-SHANGHAI = ZoneInfo("Asia/Shanghai")
+from app.temporal import SHANGHAI, beijing_today
 
 
 def _account_enabled(session) -> bool:
@@ -49,7 +46,7 @@ def _run_eod() -> None:
     with SessionLocal() as session:
         if not _account_enabled(session):
             return
-    resolved = date.today()
+    resolved = beijing_today()
 
     def job(session, run, reporter: RunProgressReporter):
         return CognitiveAgent(session).run_eod(resolved, run=run, reporter=reporter)
@@ -66,7 +63,7 @@ def _run_intraday() -> None:
     with SessionLocal() as session:
         if not _account_can_execute(session):
             return
-    resolved = date.today()
+    resolved = beijing_today()
 
     def job(session, run, reporter: RunProgressReporter):
         return asyncio.run(IntradayService(session).run(resolved, run=run, reporter=reporter))
@@ -86,7 +83,7 @@ def _run_intraday() -> None:
 
 
 def _attribute() -> None:
-    resolved = date.today()
+    resolved = beijing_today()
 
     def job(session, run, reporter: RunProgressReporter):
         reporter.update("ATTRIBUTING", "计算到期决策的真实结果与归因")
@@ -108,7 +105,7 @@ def _weekly() -> None:
     with SessionLocal() as session:
         if not _account_enabled(session):
             return
-    resolved = date.today()
+    resolved = beijing_today()
 
     def job(session, run, reporter: RunProgressReporter):
         return EvolutionService(session).generate_weekly_lessons(resolved, run=run, reporter=reporter)
@@ -125,7 +122,7 @@ def _monthly() -> None:
     with SessionLocal() as session:
         if not _account_enabled(session):
             return
-    resolved = date.today()
+    resolved = beijing_today()
 
     def job(session, run, reporter: RunProgressReporter):
         return EvolutionService(session).generate_monthly_challenger(resolved, run=run, reporter=reporter)

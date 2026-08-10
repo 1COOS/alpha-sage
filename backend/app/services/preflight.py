@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -17,6 +17,7 @@ from app.models import (
 )
 from app.services.market_adapter import CNMarketAdapter
 from app.services.secrets import SecretStore
+from app.temporal import beijing_today
 
 
 class PreflightService:
@@ -36,7 +37,7 @@ class PreflightService:
         )
 
         try:
-            rule = CNMarketAdapter(self.session).rule_version(date.today())
+            rule = CNMarketAdapter(self.session).rule_version(beijing_today())
             required = {
                 "commission_rate",
                 "minimum_commission",
@@ -83,7 +84,8 @@ class PreflightService:
             item.symbol: item
             for item in self.session.scalars(select(Instrument).where(Instrument.investable.is_(True)))
         }
-        history_target = date.today() - timedelta(days=5 * 366)
+        today = beijing_today()
+        history_target = today - timedelta(days=5 * 366)
         covered_symbols: set[str] = set()
         artifacts = self.session.scalars(
             select(DataArtifact)
@@ -96,9 +98,9 @@ class PreflightService:
             if instrument is None or artifact.min_date is None or artifact.max_date is None:
                 continue
             expected_start = max(history_target, instrument.listed_on) if instrument.listed_on else history_target
-            if artifact.min_date <= expected_start + timedelta(
-                days=45
-            ) and artifact.max_date >= date.today() - timedelta(days=10):
+            if artifact.min_date <= expected_start + timedelta(days=45) and artifact.max_date >= today - timedelta(
+                days=10
+            ):
                 covered_symbols.add(symbol)
         checks.append(
             PreflightCheck(
@@ -108,7 +110,7 @@ class PreflightService:
             )
         )
 
-        start = date.today() - timedelta(days=10)
+        start = today - timedelta(days=10)
         calendar_count = (
             self.session.scalar(
                 select(func.count()).select_from(MarketCalendarDay).where(MarketCalendarDay.trade_date >= start)

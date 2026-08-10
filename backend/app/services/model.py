@@ -4,7 +4,6 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from time import perf_counter
 from typing import Any, Protocol, TypeVar
 
@@ -17,6 +16,7 @@ from app.config import get_settings
 from app.models import ModelInvocation, SystemSetting
 from app.services.audit import stable_hash
 from app.services.secrets import SecretStore
+from app.temporal import beijing_day_start_utc
 
 T = TypeVar("T", bound=BaseModel)
 MODEL_FAILURE_AUDIT_ATTR = "_alpha_sage_model_failure_audit"
@@ -193,7 +193,7 @@ class OpenAICompatibleModel:
         run_id: str | None = None,
         fast: bool = False,
     ) -> str:
-        day_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start = beijing_day_start_utc()
         used = (
             self.session.scalar(
                 select(func.count()).select_from(ModelInvocation).where(ModelInvocation.created_at >= day_start)
